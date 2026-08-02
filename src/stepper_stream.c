@@ -221,9 +221,19 @@ void gf_stream_wakeup (void)
              * origin) and preload one depth of pad slots. */
             gf.shipped = 0;
             gf.produced = gf.depth;
+        } else {
+            /* Continuation while the kernel still drains: the due/ship
+             * cursor kept marching through the idle gap between cycles,
+             * so production must resume AT the cursor's current wall
+             * position, not at the old stream end - otherwise every new
+             * event maps behind the cursor and clamps forward into step
+             * bursts (observed live: a back-to-back return move lost
+             * steps with thousands of clamps). The skipped slots ship as
+             * zero pads: the machine really was idle for that time. */
+            uint64_t due_now = (uint64_t)((wall_s() - gf.ship_t0) * gf.rate) + gf.depth;
+            if(due_now > gf.produced)
+                gf.produced = due_now;
         }
-        /* Continuation while the kernel still drains: append after what
-         * has been produced so far. */
         gf.base = gf.produced;
         if(gf.active)
             gfio_wr_attr("cnc/streaming", "1");
@@ -267,6 +277,10 @@ static void *producer_thread (void *arg)
         uint64_t n_calls = 0, slept = 0;
         double t_run = wall_s(), max_behind = 0.0;
 
+        pthread_mutex_lock(&gf.lock);
+        uint64_t clamped0 = gf.clamped;
+        pthread_mutex_unlock(&gf.lock);
+
         while(armed && !quit) {
 
             gf_core_lock();
@@ -309,7 +323,7 @@ static void *producer_thread (void *arg)
                     (unsigned long long)n_calls, wall_s() - t_run,
                     (wall_s() - t_run) * 1e6 / (double)n_calls,
                     (unsigned long long)slept, max_behind * 1e3,
-                    (unsigned long long)gf.clamped);
+                    (unsigned long long)(gf.clamped - clamped0));
     }
 
     return NULL;
