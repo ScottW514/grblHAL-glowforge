@@ -36,6 +36,7 @@
 #include "driver.h"
 #include "serial.h"
 #include "stepper_stream.h"
+#include "glowforge_cooling.h"
 #include "eeprom.h"
 #include "grbl_eeprom_extensions.h"
 
@@ -48,7 +49,6 @@ static pthread_mutex_t core_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 
 static on_execute_realtime_ptr on_execute_realtime;
 static driver_reset_ptr driver_reset_chain;
-static coolant_state_t coolant_state = {0};
 static _Atomic bool exit_requested = false;
 
 /* Deferred hal.delay_ms callback (fired from the realtime hook; the core
@@ -179,12 +179,13 @@ static control_signals_t systemGetState (void)
 
 static void coolantSetState (coolant_state_t mode)
 {
-    coolant_state = mode;
+    /* M8/M9 drive the fan profiles (LightBurn's per-layer air assist). */
+    gfcool_coolant_set(mode);
 }
 
 static coolant_state_t coolantGetState (void)
 {
-    return coolant_state;
+    return gfcool_coolant_get();
 }
 
 /* --- atomics: serialized by the core lock (see file header) -------------- */
@@ -310,6 +311,8 @@ static void glowforge_process_realtime (uint_fast16_t state)
         system_raise_alarm(Alarm_MotorFault);
     }
 
+    gfcool_poll();
+
     if(exit_requested && state != STATE_CYCLE && state != STATE_JOG && state != STATE_HOMING)
         exit(EXIT_SUCCESS);
 
@@ -331,6 +334,7 @@ bool driver_setup (settings_t *settings)
 bool driver_init (void)
 {
     gf_stream_init();
+    gfcool_init();
 
     hal.info = "Glowforge";
     hal.driver_version = "260802";

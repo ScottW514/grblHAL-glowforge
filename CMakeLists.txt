@@ -43,6 +43,7 @@ add_executable(grblHAL_glowforge
     src/driver.c
     src/stepper_stream.c
     src/glowforge_io.c
+    src/glowforge_cooling.c
     src/serial.c
     src/eeprom.c
     src/grbl_eeprom_extensions.c
