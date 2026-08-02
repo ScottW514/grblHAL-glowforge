@@ -226,12 +226,59 @@ static void irqEnable (void)
 
 /* ------------------------------------------------------------------------- */
 
+/* --- locked laser spindle -------------------------------------------------
+ * Senders (LightBurn et al) drive lasers with M3/M4 + S words and expect
+ * $32 laser mode; grblHAL rejects M4 and won't latch $32 unless a
+ * laser-capable spindle is registered. This spindle advertises the
+ * capabilities and swallows everything: power values go nowhere, the
+ * pulse stream never carries the laser bit, and the kernel laser latch
+ * stays locked. It becomes the real laser mapping in a later, scope-gated
+ * milestone. */
+
+static spindle_state_t spindle_state = {0};
+
+static bool spindleConfig (spindle_ptrs_t *spindle)
+{
+    /* The core dereferences context.pwm->settings for any PWM-type
+     * spindle (spindle_activate); precompute wires that context up even
+     * though our power handlers discard everything. */
+    static spindle_pwm_t spindle_pwm;
+
+    if(spindle == NULL)
+        return false;
+
+    spindle_precompute_pwm_values(spindle, &spindle_pwm, &settings.pwm_spindle, 1000000);
+
+    return true;
+}
+
+static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, float rpm)
+{
+    (void)spindle; (void)rpm;
+    spindle_state = state;
+}
+
+static spindle_state_t spindleGetState (spindle_ptrs_t *spindle)
+{
+    (void)spindle;
+    return spindle_state;
+}
+
+static uint_fast16_t spindleGetPWM (spindle_ptrs_t *spindle, float rpm)
+{
+    (void)spindle; (void)rpm;
+    return 0;
+}
+
+static void spindleUpdatePWM (spindle_ptrs_t *spindle, uint_fast16_t pwm)
+{
+    (void)spindle; (void)pwm;
+}
+
 void settings_changed (settings_t *settings, settings_changed_flags_t changed)
 {
     (void)settings; (void)changed;
-    /* Must exist: the core's wrapper calls it without a NULL check. No
-     * driver-side settings consumers yet (spindle/laser is a later
-     * milestone). */
+    /* Must exist: the core's wrapper calls it without a NULL check. */
 }
 
 static void driverReset (void)
@@ -316,8 +363,19 @@ bool driver_init (void)
 
     hal.control.get_state = systemGetState;
 
-    /* No spindle registered: the core adds a null spindle. The laser maps
-     * to a laser-capable spindle in a later, scope-gated milestone. */
+    static const spindle_ptrs_t spindle = {
+        .type = SpindleType_PWM,
+        .cap.variable = On,
+        .cap.laser = On,
+        .cap.direction = On,
+        .config = spindleConfig,
+        .get_pwm = spindleGetPWM,
+        .update_pwm = spindleUpdatePWM,
+        .set_state = spindleSetState,
+        .get_state = spindleGetState
+    };
+
+    spindle_register(&spindle, "Glowforge laser (locked)");
 
     memcpy(&hal.stream, serialInit(), sizeof(io_stream_t));
 

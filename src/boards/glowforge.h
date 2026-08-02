@@ -41,3 +41,9 @@
 #define DEFAULT_X_MAX_TRAVEL 495.0f // mm
 #define DEFAULT_Y_MAX_TRAVEL 279.0f
 #define DEFAULT_Z_MAX_TRAVEL 10.6f
+
+// It is a laser: $32 on by default so senders' M3/M4 dynamic-power
+// semantics work without a settings dance. Fire remains impossible at
+// this stage (locked spindle + hardware laser latch + no laser bit in
+// the pulse stream).
+#define DEFAULT_LASER_MODE On
