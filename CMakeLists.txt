@@ -60,3 +60,5 @@ target_link_libraries(grblHAL_glowforge PRIVATE
 
 # Generated build_info.h lands in the build dir.
 target_include_directories(grblHAL_glowforge PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+install(TARGETS grblHAL_glowforge RUNTIME DESTINATION bin)
