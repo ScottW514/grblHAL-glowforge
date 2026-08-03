@@ -227,8 +227,8 @@ void gf_stream_wakeup (void)
              * so production must resume AT the cursor's current wall
              * position, not at the old stream end - otherwise every new
              * event maps behind the cursor and clamps forward into step
-             * bursts (observed live: a back-to-back return move lost
-             * steps with thousands of clamps). The skipped slots ship as
+             * bursts (a back-to-back return move loses steps with
+             * thousands of clamps). The skipped slots ship as
              * zero pads: the machine really was idle for that time. */
             uint64_t due_now = (uint64_t)((wall_s() - gf.ship_t0) * gf.rate) + gf.depth;
             if(due_now > gf.produced)

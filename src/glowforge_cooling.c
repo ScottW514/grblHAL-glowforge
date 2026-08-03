@@ -7,18 +7,19 @@
   CM* in millidegrees - run ceiling 33 C (CMrx), start/resume gate 31 C
   (CMwx), idle max 50 C. All thresholds env-adjustable.
 
-  Policy (v2):
+  Policy:
   - IDLE: pump on, TEC off, purge on, fans at factory idle, HEATER OFF
     (an always-on flow heater measurably warms the loop - ~1.5 C in
     minutes on this machine - eating headroom below the 31 C start gate
     for no benefit while nothing can fire).
-  - RUN (M8, LightBurn's per-layer air assist): cut-profile fans AND the
-    flow-verification heater at the factory 10% duty. The heater sits
-    between the two water-temp sensors; flowing coolant carries its heat
-    away. Measured here 2026-08-02: flow dT settles +2.5..4.0 C (never
-    sustains >4.1), pump-stopped dT hits +4.6..5.7 within 20 s. Flow
-    faulting arms 30 s after heater-on (dT needs ~15-20 s to establish)
-    and warns at dT>4.5 C sustained 20 s (re-arms below 4.0).
+  - RUN (M8, LightBurn's per-layer air assist): cut-profile fans, plus
+    periodic coolant-flow verification. The flow heater sits between
+    the two water-temp sensors; each check runs it at FLOW_HEATER_PCT
+    for FLOW_CHECK_S and faults if the downstream sensor rises more
+    than FLOW_FAULT_RISE_C (flowing coolant carries the heat away; a
+    stagnant loop cooks the downstream sensor). Checks repeat every
+    FLOW_RECHECK_S and start only from a thermally settled loop; the
+    constants below carry the measured rationale.
   - COOLDOWN (M9): 15 s smoke-clear at run duty, then a thermal phase at
     reduced duty (fan airflow measurably cools the loop) until the
     upstream temp is back under the resume gate or a timeout expires;
@@ -114,8 +115,8 @@
  * newer half of the window and the mean of the older half. Peak-to-peak
  * does not work: measured on a settled loop this sensor shows 0.52 C of
  * p-p jitter over 15 s (0.70 worst), so any p-p threshold tight enough
- * to catch drift sits below the noise floor and the gate never opens -
- * which is exactly what happened on the first attempt. Averaging each
+ * to catch drift sits below the noise floor and the gate never opens.
+ * Averaging each
  * half cuts that to 0.11 C typical / 0.21 C worst, while a real cooling
  * transient (~2 C per 15 s) still shows ~1.5 C. */
 #define FLOW_SETTLE_DT_C    1.5f    /* |downstream - upstream| */
@@ -127,17 +128,17 @@
  * check, not the upstream/downstream delta. Measured from cold at 30%
  * heater: with flow the downstream plateaus at about +10.5 C, without
  * flow it passes +16 C and is still climbing - a ~6 C margin, versus
- * only ~2 C for the delta. The delta looked adequate in steady-state
- * characterization but produced a FALSE NEGATIVE in a live pump-off
- * drill (reported 8.8 C against a 10.2 C limit), because a check that
- * starts from a cold heater never reaches the steady-state delta. */
+ * only ~2 C for the delta. The delta is NOT a usable discriminator: a
+ * check that starts from a cold heater never reaches the steady-state
+ * delta (bench: a live pump-off drill reads 8.8 C against a 10.2 C
+ * limit - a false negative). */
 /* Balanced midpoint of the pooled bracket at 40%/50 s: across 17 flow
  * observations (design matrix, repeat validations, and a 40-minute
  * sustained run) the largest healthy rise was 12.75 C, and across 8
  * pump-stopped observations the smallest was 16.04 C. 14.4 sits ~1.6 C
  * from either edge. All baselines were 19-23 C; the warm-loop end of
- * the range is NOT yet validated (see the caveat in BRINGUP - the
- * remaining commissioning item). GFCOOL_FLOW_RISE overrides. */
+ * the range is NOT yet validated (a first-light commissioning item).
+ * GFCOOL_FLOW_RISE overrides. */
 #define FLOW_FAULT_RISE_C  14.4f
 
 typedef enum {
@@ -256,9 +257,8 @@ static void flow_check_start (double now)
  * adc_steps = 1024. Proof it is the right one: running the firmware's
  * inverse on the cloud's coolant setpoints reproduces this machine's
  * WT* settings exactly (CMet 18134 mDeg -> raw 754 = WTub; CMdt 18364
- * -> raw 751 = WTvb). The old UAPI.md linear "best guess"
- * (raw*-0.09653+94) was ~3-5 C high with the wrong slope; measured
- * against a thermometer at equilibrium this curve lands within ~1 C. */
+ * -> raw 751 = WTvb); measured against a thermometer at equilibrium
+ * the curve lands within ~1 C. */
 static float thermistor_c (int raw)
 {
     static const double adc_f = 1024.0 * 1.3;   /* 1331.2 */

@@ -67,8 +67,7 @@ void platform_init()
     }
 
     // If STDIN is a terminal, switch it to raw (non-canonical, no echo) mode
-    // once. For a pipe/redirected file tcgetattr() fails and we leave it alone,
-    // matching the old per-poll code (which no-op'd on non-ttys).
+    // once. For a pipe/redirected file tcgetattr() fails and we leave it alone.
     if (isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &orig_termios) == 0) {
         struct termios raw = orig_termios;
         raw.c_lflag &= ~(ICANON);
@@ -145,14 +144,14 @@ uint8_t platform_poll_stdin()
 {
     uint8_t char_in = 0;
 
-    // STDIN was put in non-blocking mode once in platform_init(), so a single
-    // read() replaces the old per-poll tcgetattr/tcsetattr/select/getchar.
+    // STDIN was put in non-blocking mode once in platform_init(), so polling
+    // is a single read().
     ssize_t n = read(STDIN_FILENO, &char_in, 1);
 
     if (n == 1)
         return char_in;   // byte available
     if (n == 0)
-        return 0xFF;      // EOF: matches old getchar()==EOF cast to uint8_t
+        return 0xFF;      // EOF: 0xFF signals end-of-input to the caller
 
     return 0;             // no data (EAGAIN/EWOULDBLOCK) or error -> nothing
 }
