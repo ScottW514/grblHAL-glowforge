@@ -47,3 +47,26 @@
 // this stage (locked spindle + hardware laser latch + no laser bit in
 // the pulse stream).
 #define DEFAULT_LASER_MODE On
+
+// Homing: accelerometer bump-detect (glowforge_homing.c) - no physical
+// switches exist. Home corner is the BACK-LEFT of the machine: X min
+// (left) and Y min (+Y physically moves the gantry toward the FRONT,
+// operator-verified). The origin is forced to the homed position, so
+// the workspace is all-positive from that corner. X and Y home in
+// separate cycles (one bump each); Z is excluded ($H never moves Z -
+// it homes against the hall sensor in a later milestone). Seek/latch
+// rates are creep speeds sized for the jolt detector; pull-off exceeds
+// the detector's ~0.5 s arming distance at both rates, so re-homing
+// from the home corner works. An approach that starts pressed against
+// the rail is caught by its grinding "baseline" and triggers at arm
+// time.
+#define DEFAULT_HOMING_ENABLE On
+#define DEFAULT_HOMING_DIR_MASK (X_AXIS_BIT|Y_AXIS_BIT) // both home to min
+#define DEFAULT_HOMING_CYCLE_0 X_AXIS_BIT
+#define DEFAULT_HOMING_CYCLE_1 Y_AXIS_BIT
+#define DEFAULT_HOMING_SEEK_RATE 300.0f         // mm/min (5 mm/s creep)
+#define DEFAULT_HOMING_FEED_RATE 60.0f          // mm/min (1 mm/s latch)
+#define DEFAULT_HOMING_PULLOFF 4.0f             // mm
+#define DEFAULT_HOMING_DEBOUNCE_DELAY 250       // ms
+#define DEFAULT_HOMING_SINGLE_AXIS_COMMANDS On  // $HX / $HY for the bench
+#define DEFAULT_HOMING_FORCE_SET_ORIGIN On      // homed corner = machine 0
