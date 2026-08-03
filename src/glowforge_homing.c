@@ -79,11 +79,15 @@
 #define SAMPLE_US       900         /* ~1 kHz poll */
 #define RAMP_MS         150         /* ignore approach accel transients */
 #define LEARN_MS        350         /* moving-baseline learning window */
-#define CONTACT_BASELINE 10000.0f   /* learned "baseline" this high means
-                                     * the approach started pressed against
-                                     * the rail and is already grinding
-                                     * (normal creep is ~3-5k, grinding
-                                     * 20-40k): treat as contact */
+#define CONTACT_BASELINE 10000.0f   /* learned "baseline" MEAN this high
+                                     * means the approach started pressed
+                                     * against the rail and is already
+                                     * grinding: treat as contact */
+#define CONTACT_SD       8000.0f    /* grinding also explodes the learned
+                                     * SD (measured ~15k vs <=2k for clean
+                                     * travel at any rate) while its mean
+                                     * can stay under CONTACT_BASELINE at
+                                     * seek speed - either signal decides */
 #define CONFIRM_SAMPLES 2
 #define TRIG_HOLD_MS    300         /* < pull-off duration, > core poll */
 #define MAX_I2C_ERRORS  5
@@ -271,7 +275,7 @@ static void *monitor (void *arg)
                     fprintf(stderr, "homing: approach axes=%02x "
                             "thresh=%.0f (base mean %.0f sd %.0f)\n",
                             (unsigned)cycle_mask, thresh, mean, sd);
-                    if (mean > CONTACT_BASELINE) {
+                    if (mean > CONTACT_BASELINE || sd > CONTACT_SD) {
                         /* started pressed against the rail */
                         pthread_mutex_lock(&home.lock);
                         home.trig_mask = cycle_mask;
