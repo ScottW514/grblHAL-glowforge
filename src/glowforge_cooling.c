@@ -81,9 +81,47 @@
  * After the check the heater goes off and absolute-temperature
  * monitoring carries the protection (a pump failure mid-cut shows up
  * far faster as a temperature climb than as a heater delta). */
-#define FLOW_HEATER_PCT    30
+/* Duty matters more than anything else here. Below ~40% the stagnant
+ * loop sheds the heater's output by natural convection well enough to
+ * MIMIC FLOW: at 30%/50 s the five no-flow trials read 8.15, 8.69,
+ * 8.78, 12.25, 13.33 C while flow never exceeded 9.08 - three of five
+ * dead-pump cases look healthier than a working pump. At 40% the heat
+ * input outruns convection and the signature becomes decisive and
+ * repeatable (see the design matrix, scripts/bench/flow_matrix.py). */
+#define FLOW_HEATER_PCT    40
 #define FLOW_CHECK_S       50      /* 0 disables the check entirely */
 #define FLOW_ESTABLISH_S   30      /* delta plateaus by here (reporting only) */
+/* Re-check cadence while a job runs. A stopped pump CANNOT be seen any
+ * other way: absolute temperature only tracks a circulating loop, and a
+ * light engrave may add so little heat that a flat trend proves
+ * nothing. Detection latency is this interval plus the check length. */
+#define FLOW_RECHECK_S     150
+
+/* A check is only meaningful from a thermally SETTLED loop. If the
+ * downstream sensor is still falling from earlier heating, the baseline
+ * is captured mid-transient and the measured rise is garbage -
+ * bench-proven to misclassify in BOTH directions, including reporting
+ * flow when the pump was stopped (a MISS).
+ *
+ * Sensor agreement alone is NOT sufficient: both sensors can be
+ * plunging together and cross within any tolerance while the loop is
+ * still far from steady - that exact case produced a miss on the bench
+ * (rise 11.2 with the pump stopped, from a loop cooling out of 48 C).
+ * So the gate also requires the downstream reading to be STATIONARY
+ * over a window before the baseline is taken.
+ *
+ * Stationarity is measured as the difference between the mean of the
+ * newer half of the window and the mean of the older half. Peak-to-peak
+ * does not work: measured on a settled loop this sensor shows 0.52 C of
+ * p-p jitter over 15 s (0.70 worst), so any p-p threshold tight enough
+ * to catch drift sits below the noise floor and the gate never opens -
+ * which is exactly what happened on the first attempt. Averaging each
+ * half cuts that to 0.11 C typical / 0.21 C worst, while a real cooling
+ * transient (~2 C per 15 s) still shows ~1.5 C. */
+#define FLOW_SETTLE_DT_C    1.5f    /* |downstream - upstream| */
+#define FLOW_SETTLE_DRIFT_C 0.4f    /* split-half mean difference */
+#define FLOW_SETTLE_WIN     15      /* 1 Hz samples */
+#define FLOW_SETTLE_WARN_S  180
 
 /* The DISCRIMINATOR is how far the downstream sensor climbs during the
  * check, not the upstream/downstream delta. Measured from cold at 30%
@@ -93,10 +131,14 @@
  * characterization but produced a FALSE NEGATIVE in a live pump-off
  * drill (reported 8.8 C against a 10.2 C limit), because a check that
  * starts from a cold heater never reaches the steady-state delta. */
-/* Midpoint of the live driver measurements: 10.3 C with the pump
- * running, 15.1 C with it stopped (both from a cooled loop) - so ~2.4 C
- * of margin either way. GFCOOL_FLOW_RISE overrides. */
-#define FLOW_FAULT_RISE_C  12.7f
+/* Balanced midpoint of the pooled bracket at 40%/50 s: across 17 flow
+ * observations (design matrix, repeat validations, and a 40-minute
+ * sustained run) the largest healthy rise was 12.75 C, and across 8
+ * pump-stopped observations the smallest was 16.04 C. 14.4 sits ~1.6 C
+ * from either edge. All baselines were 19-23 C; the warm-loop end of
+ * the range is NOT yet validated (see the caveat in BRINGUP - the
+ * remaining commissioning item). GFCOOL_FLOW_RISE overrides. */
+#define FLOW_FAULT_RISE_C  14.4f
 
 typedef enum {
     Cool_Idle = 0,
@@ -114,8 +156,15 @@ static float temp_resume_c = TEMP_RESUME_C_DEFAULT;
 static float flow_fault_rise = FLOW_FAULT_RISE_C;
 static uint32_t flow_heater_pct = FLOW_HEATER_PCT;
 static uint32_t flow_check_s = FLOW_CHECK_S;
+static uint32_t flow_recheck_s = FLOW_RECHECK_S;
+static double flow_next_check;
 static bool flow_check_active = false;
+static bool flow_check_pending = false;
+static double flow_pending_since;
+static bool flow_settle_warned = false;
 static bool flow_base_set = false;
+static float down_hist[FLOW_SETTLE_WIN];
+static uint32_t down_hist_n = 0;
 static float flow_base_down;
 static double flow_establish_at, flow_check_end;
 static float flow_dt_sum;
@@ -180,6 +229,19 @@ static void heater_set_pct (uint32_t pct)
     gfio_wr_attr("thermal/heater_pwm", val);
 }
 
+/* Begin a flow check: heater up, baseline captured on the next poll,
+ * verdict at the end of the window, heater back off. */
+static void flow_check_start (double now)
+{
+    flow_check_active = true;
+    flow_base_set = false;
+    flow_establish_at = now + FLOW_ESTABLISH_S;
+    flow_check_end = now + (double)flow_check_s;
+    flow_dt_sum = 0.0f;
+    flow_dt_n = 0;
+    heater_set_pct(flow_heater_pct);
+}
+
 /* Raw ADC -> degrees C for the two coolant thermistors.
  *
  * This is the FACTORY conversion, recovered from the v2.6.0 firmware
@@ -235,6 +297,8 @@ void gfcool_init (void)
         flow_heater_pct = (uint32_t)atoi(opt);
     if((opt = getenv("GFCOOL_FLOW_CHECK_S")))
         flow_check_s = (uint32_t)atoi(opt);
+    if((opt = getenv("GFCOOL_RECHECK_S")))
+        flow_recheck_s = (uint32_t)atoi(opt);
     if((opt = getenv("GFCOOL_COOLDOWN_S")))
         smoke_s = (uint32_t)atoi(opt);
     if((opt = getenv("GFCOOL_COOLDOWN_MAX_S")))
@@ -262,21 +326,17 @@ void gfcool_coolant_set (coolant_state_t state)
     if(state.flood) {
         cool_state = Cool_Run;
         fans_run();
-        /* Start the one-shot flow check: heater up, sample the delta
-         * once it has plateaued, verdict, heater back off. */
-        if(flow_check_s > 0 && !flow_check_active) {
-            double now = wall_s();
-            flow_check_active = true;
-            flow_base_set = false;
-            flow_establish_at = now + FLOW_ESTABLISH_S;
-            flow_check_end = now + (double)flow_check_s;
-            flow_dt_sum = 0.0f;
-            flow_dt_n = 0;
-            heater_set_pct(flow_heater_pct);
+        /* Request a check at job start; the poll starts it once the
+         * loop is settled, then repeats it on the re-check cadence. */
+        if(flow_check_s > 0 && !flow_check_active && !flow_check_pending) {
+            flow_check_pending = true;
+            flow_pending_since = wall_s();
+            flow_settle_warned = false;
         }
     } else if(cool_state == Cool_Run) {
         cool_state = Cool_Smoke;
         phase_until = wall_s() + (double)smoke_s;
+        flow_check_pending = false;
         if(flow_check_active) {     /* job ended before the verdict */
             flow_check_active = false;
             heater_set_pct(0);
@@ -380,6 +440,8 @@ void gfcool_poll (void)
 
             flow_check_active = false;
             heater_set_pct(0);
+            /* Schedule the next interrogation if the job is still on. */
+            flow_next_check = now + (double)flow_recheck_s;
 
             if(rise > flow_fault_rise) {
                 snprintf(msg, sizeof(msg),
@@ -392,6 +454,49 @@ void gfcool_poll (void)
                 report_message(msg, Message_Info);
                 fprintf(stderr, "gfcool: %s\n", msg);
             }
+        }
+    } else if(cool_state == Cool_Run && flow_check_s > 0 && flow_recheck_s > 0
+               && !flow_check_pending && now >= flow_next_check) {
+        flow_check_pending = true;  /* periodic re-interrogation mid-job */
+        flow_pending_since = now;
+        flow_settle_warned = false;
+    }
+
+    /* Track downstream history for the stationarity test below. It is
+     * only meaningful while the heater is off, so a running check
+     * invalidates it. */
+    if(have_down) {
+        if(flow_check_active)
+            down_hist_n = 0;
+        else {
+            down_hist[down_hist_n % FLOW_SETTLE_WIN] = down;
+            down_hist_n++;
+        }
+    }
+
+    /* Gate: a pending check only starts from a settled loop - sensors
+     * in agreement AND the downstream reading stationary. */
+    if(flow_check_pending && !flow_check_active && have_down && have_up) {
+        bool stationary = down_hist_n >= FLOW_SETTLE_WIN;
+        if(stationary) {
+            uint32_t base = down_hist_n - FLOW_SETTLE_WIN;
+            float old_sum = 0.0f, new_sum = 0.0f;
+            for(uint32_t i = 0; i < 7; i++)
+                old_sum += down_hist[(base + i) % FLOW_SETTLE_WIN];
+            for(uint32_t i = 7; i < FLOW_SETTLE_WIN; i++)
+                new_sum += down_hist[(base + i) % FLOW_SETTLE_WIN];
+            stationary = fabsf(new_sum / 8.0f - old_sum / 7.0f) <= FLOW_SETTLE_DRIFT_C;
+        }
+        if(stationary && fabsf(down - up) <= FLOW_SETTLE_DT_C) {
+            flow_check_pending = false;
+            flow_check_start(now);
+        } else if(!flow_settle_warned && now - flow_pending_since > FLOW_SETTLE_WARN_S) {
+            flow_settle_warned = true;
+            char msg[96];
+            snprintf(msg, sizeof(msg),
+                     "flow check deferred: loop not settled (dT %.1f C, %s)",
+                     down - up, stationary ? "drifting" : "sensors disagree");
+            warn(msg);
         }
     }
 
