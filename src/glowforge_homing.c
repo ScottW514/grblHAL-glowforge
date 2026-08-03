@@ -23,17 +23,29 @@
 
   Detection is per approach phase: the core's on_homing_rate_set event
   marks each Seek/Locate/Pulloff phase, and every approach runs a fresh
-  ramp-skip + baseline-learn + detect session (the locate creep is much
-  quieter than the seek, so it earns its own tighter threshold), while
-  pull-off phases suspend detection entirely - the reversal and stop
-  jerks of a pull-off would otherwise read as contact against a
+  ramp-skip + baseline-learn + detect session (the locate approach is
+  much quieter than the seek, so it earns its own tighter threshold),
+  while pull-off phases suspend detection entirely - the reversal and
+  stop jerks of a pull-off would otherwise read as contact against a
   quiet-baseline threshold, failing the pull-off completion check.
-  Trigger condition: summed 3-axis deviation from an EMA gravity tracker
-  exceeding max(mean + k*sigma, floor) for two consecutive samples.
-  Bench-measured contact jolts run 20-40x the creep baseline and cross
-  within ~4 ms. An approach whose learned "baseline" is itself at
-  grinding level means it started pressed against the rail and triggers
-  immediately.
+
+  The detection metric is sustained energy, not single-sample amplitude:
+  a sliding-window sum of the per-sample 3-axis deviation from an EMA
+  gravity tracker. Contact cannot be brief - after the strike the stream
+  keeps pushing through the kernel queue, so the head grinds against the
+  rail for ~100+ ms of large sustained deviations - while travel noise
+  spikes last single milliseconds and barely move a 16 ms window sum.
+  Single-sample thresholds proved margin-starved at fast seek (noisy
+  baselines inflate a mean+8*sd threshold into the band of weak contact
+  strikes, which vary widely with belt compliance); window sums restore
+  ~4x+ separation on both phases. The baseline is learned per approach
+  as median + k*MAD of window sums (outlier-immune: spikes or grinding
+  pollution cannot blow the threshold up the way they did the mean/sd),
+  and the trigger requires the window sum to stay over threshold for
+  CONFIRM_SAMPLES consecutive samples - longer than any noise burst,
+  far shorter than the grind. An approach whose learned baseline MEDIAN
+  is itself at grinding level started pressed against the rail and
+  triggers at arm time.
 
   If the sensor fails while armed the monitor injects EXEC_RESET so the
   homing cycle aborts safely instead of grinding to the over-travel
@@ -79,21 +91,34 @@
 #define SAMPLE_US       900         /* ~1 kHz poll */
 #define RAMP_MS         150         /* ignore approach accel transients */
 #define LEARN_MS        350         /* moving-baseline learning window */
-#define CONTACT_BASELINE 10000.0f   /* learned "baseline" MEAN this high
+#define CEIL_WSUM       150000.0f   /* threshold ceiling: keeps a polluted
+                                     * learn window (post-crash ring-down)
+                                     * from lifting the threshold above
+                                     * fast-strike/grind energy, which
+                                     * measures 300-500k */
+#define ENERGY_WINDOW   16          /* samples in the sliding energy sum */
+#define LEARN_MAX       512         /* window-sum samples kept for stats */
+#define K_MAD           6.0f        /* threshold = med + K*MADsigma */
+#define FLOOR_WSUM      40000.0f    /* absolute threshold floor (counts) */
+#define CONTACT_MEDIAN  100000.0f   /* learned window-sum MEDIAN this high
                                      * means the approach started pressed
-                                     * against the rail and is already
-                                     * grinding: treat as contact */
-#define CONTACT_SD       8000.0f    /* grinding also explodes the learned
-                                     * SD (measured ~15k vs <=2k for clean
-                                     * travel at any rate) while its mean
-                                     * can stay under CONTACT_BASELINE at
-                                     * seek speed - either signal decides */
-#define CONFIRM_SAMPLES 2
+                                     * and is grinding (grinding windows
+                                     * measure ~150-250k; clean fast seek
+                                     * ~30-60k): trigger at arm time */
+#define CONFIRM_SAMPLES 64          /* sustained (~64 ms) over threshold.
+                                     * Duration is the discriminator, not
+                                     * amplitude: travel-vibration bursts
+                                     * (rail joints, resonances) overlap
+                                     * weak contact strikes in energy but
+                                     * last only 10-30 ms, while real
+                                     * contact grinds for 200+ ms as the
+                                     * queued stream pushes through. The
+                                     * extra ~1.6 mm of seek push-through
+                                     * this costs is absorbed by the
+                                     * pressed-position reference. */
 #define TRIG_HOLD_MS    300         /* < pull-off duration, > core poll */
 #define MAX_I2C_ERRORS  5
 #define EMA_ALPHA       0.05f
-#define K_SIGMA_DEFAULT 8.0f
-#define FLOOR_DEFAULT   3000.0f     /* counts of summed 3-axis deviation */
 
 static struct {
     pthread_t       tid;
@@ -106,13 +131,13 @@ static struct {
     axes_signals_t  cycle;
     uint32_t        trig_mask;
     struct timespec trig_at;
-    float           k_sigma;
-    float           floor_thresh;
+    float           k_mad;
+    float           floor_wsum;
 } home = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .cv = PTHREAD_COND_INITIALIZER,
-    .k_sigma = K_SIGMA_DEFAULT,
-    .floor_thresh = FLOOR_DEFAULT,
+    .k_mad = K_MAD,
+    .floor_wsum = FLOOR_WSUM,
 };
 
 static on_homing_rate_set_ptr on_homing_rate_set_chain;
@@ -171,6 +196,24 @@ static int sensor_read (int fd, int16_t out[3])
     return 0;
 }
 
+static int cmp_float (const void *a, const void *b)
+{
+    float fa = *(const float *)a, fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
+
+/* median + MAD-sigma of n values (scratch is modified) */
+static void med_madsigma (float *scratch, unsigned n, float *med,
+                          float *madsigma)
+{
+    qsort(scratch, n, sizeof(float), cmp_float);
+    *med = scratch[n / 2];
+    for (unsigned i = 0; i < n; i++)
+        scratch[i] = fabsf(scratch[i] - *med);
+    qsort(scratch, n, sizeof(float), cmp_float);
+    *madsigma = 1.4826f * scratch[n / 2];
+}
+
 static void *monitor (void *arg)
 {
     (void)arg;
@@ -195,7 +238,10 @@ static void *monitor (void *arg)
 
         float ema[3];
         bool ema_seeded = false;
-        double sum = 0.0, sum2 = 0.0;
+        float win[ENERGY_WINDOW] = {0};
+        float win_sum = 0.0f;
+        unsigned win_i = 0, win_n = 0;
+        static float learn[LEARN_MAX], scratch[LEARN_MAX];
         unsigned n = 0;
         float thresh = 0.0f;
         int over = 0, errors = 0;
@@ -229,7 +275,9 @@ static void *monitor (void *arg)
                 /* new approach phase: fresh baseline and threshold */
                 seen_gen = gen;
                 clock_gettime(CLOCK_MONOTONIC, &phase_at);
-                sum = sum2 = 0.0;
+                memset(win, 0, sizeof(win));
+                win_sum = 0.0f;
+                win_i = win_n = 0;
                 n = 0;
                 thresh = 0.0f;
                 over = 0;
@@ -258,24 +306,33 @@ static void *monitor (void *arg)
                 ema[i] += EMA_ALPHA * ((float)v[i] - ema[i]);
             }
 
+            /* sliding energy window */
+            win_sum += dev - win[win_i];
+            win[win_i] = dev;
+            win_i = (win_i + 1) % ENERGY_WINDOW;
+            if (win_n < ENERGY_WINDOW)
+                win_n++;
+
             double t = ms_since(&phase_at);
-            if (!detecting || fired || t < RAMP_MS) {
-                /* pull-off phase, already fired, or approach ramp:
-                 * keep the gravity tracker settled, nothing else */
+            if (!detecting || fired || t < RAMP_MS ||
+                win_n < ENERGY_WINDOW) {
+                /* pull-off phase, already fired, approach ramp, or the
+                 * window still filling: keep the trackers settled */
             } else if (t < RAMP_MS + LEARN_MS) {
-                sum += dev;
-                sum2 += (double)dev * dev;
-                n++;
+                if (n < LEARN_MAX)
+                    learn[n++] = win_sum;
             } else {
                 if (thresh == 0.0f && n > 0) {
-                    float mean = (float)(sum / n);
-                    float sd = sqrtf((float)(sum2 / n) - mean * mean);
-                    thresh = fmaxf(mean + home.k_sigma * sd,
-                                   home.floor_thresh);
+                    float med, madsigma;
+                    memcpy(scratch, learn, n * sizeof(float));
+                    med_madsigma(scratch, n, &med, &madsigma);
+                    thresh = fmaxf(med + home.k_mad * madsigma,
+                                   home.floor_wsum);
+                    thresh = fminf(thresh, CEIL_WSUM);
                     fprintf(stderr, "homing: approach axes=%02x "
-                            "thresh=%.0f (base mean %.0f sd %.0f)\n",
-                            (unsigned)cycle_mask, thresh, mean, sd);
-                    if (mean > CONTACT_BASELINE || sd > CONTACT_SD) {
+                            "thresh=%.0f (wsum med %.0f madsig %.0f)\n",
+                            (unsigned)cycle_mask, thresh, med, madsigma);
+                    if (med > CONTACT_MEDIAN) {
                         /* started pressed against the rail */
                         pthread_mutex_lock(&home.lock);
                         home.trig_mask = cycle_mask;
@@ -286,7 +343,7 @@ static void *monitor (void *arg)
                                 "start (grinding baseline)\n");
                     }
                 }
-                if (thresh > 0.0f && dev > thresh) {
+                if (thresh > 0.0f && win_sum > thresh) {
                     if (++over >= CONFIRM_SAMPLES) {
                         pthread_mutex_lock(&home.lock);
                         home.trig_mask = cycle_mask;
@@ -294,7 +351,7 @@ static void *monitor (void *arg)
                         pthread_mutex_unlock(&home.lock);
                         fired = true;
                         fprintf(stderr,
-                                "homing: contact (dev %.0f)\n", dev);
+                                "homing: contact (wsum %.0f)\n", win_sum);
                     }
                 } else {
                     over = 0;
@@ -339,10 +396,10 @@ static void homingRateSet (axes_signals_t axes, coord_data_t *feedrate,
 void gfhome_init (void)
 {
     const char *v;
-    if ((v = getenv("GFHOME_KSIGMA")) != NULL && atof(v) > 0.0)
-        home.k_sigma = (float)atof(v);
+    if ((v = getenv("GFHOME_KMAD")) != NULL && atof(v) > 0.0)
+        home.k_mad = (float)atof(v);
     if ((v = getenv("GFHOME_FLOOR")) != NULL && atof(v) > 0.0)
-        home.floor_thresh = (float)atof(v);
+        home.floor_wsum = (float)atof(v);
 
     on_homing_rate_set_chain = grbl.on_homing_rate_set;
     grbl.on_homing_rate_set = homingRateSet;

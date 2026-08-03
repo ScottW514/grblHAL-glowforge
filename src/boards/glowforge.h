@@ -66,7 +66,12 @@
 #define DEFAULT_HOMING_CYCLE_0 X_AXIS_BIT
 #define DEFAULT_HOMING_CYCLE_1 Y_AXIS_BIT
 #define DEFAULT_HOMING_SEEK_RATE 1500.0f        // mm/min (25 mm/s seek)
-#define DEFAULT_HOMING_FEED_RATE 300.0f         // mm/min (5 mm/s latch)
+// The locate pass runs at seek speed too: it is a second fast strike,
+// not a precision re-find. Slow approaches CANNOT be detected on this
+// machine - belt compliance turns slow-speed skipping into near-silent
+// grinding (bench-measured under every threshold) - and approach speed
+// does not affect accuracy because the rail itself is the reference.
+#define DEFAULT_HOMING_FEED_RATE 1500.0f        // mm/min
 // Pull-off must exceed the detector's arming distance AT SEEK RATE
 // (~0.5 s = 12.5 mm at 25 mm/s), so a machine parked at the home
 // pull-off re-homes with the detector armed before contact.

@@ -36,6 +36,7 @@
 #include <netinet/tcp.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 static stream_tx_buffer_t txbuffer = {0};
@@ -100,17 +101,43 @@ static void serialRxCancel (void)
     rxbuffer.head = (rxbuffer.tail + 1) & (RX_BUFFER_SIZE - 1);
 }
 
+/* Zero-drain-progress bound before a stalled client is dropped. Output
+ * must NEVER block the caller indefinitely: the homing loop writes
+ * status reports mid-cycle, and a blocked write here once kept a homing
+ * seek streaming into the rail for the length of a wifi stall. On a
+ * healthy link the ring drains in microseconds; 100 ms with no progress
+ * means the peer is gone or wedged. */
+#define TX_STALL_MS 100
+
 static bool serialPutC (const uint8_t c)
 {
     uint_fast16_t next_head;
 
     next_head = (txbuffer.head + 1) & (TX_BUFFER_SIZE - 1);     // Get and update head pointer
 
-    while(txbuffer.tail == next_head) {                         // Buffer full, block until space is available...
-        // hal.stream_blocking_callback -> protocol_execute_realtime -> our
-        // realtime hook -> serial_poll() drains TX on this same thread.
-        if(!hal.stream_blocking_callback())
-            return false;
+    if(txbuffer.tail == next_head) {                            // Buffer full...
+        struct timespec t0, t;
+        uint_fast16_t seen_tail = txbuffer.tail;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        while(txbuffer.tail == next_head) {
+            // hal.stream_blocking_callback -> protocol_execute_realtime ->
+            // our realtime hook -> serial_poll() drains TX on this thread.
+            if(!hal.stream_blocking_callback())
+                return false;
+            if(txbuffer.tail != seen_tail) {                    // progress: restart the clock
+                seen_tail = txbuffer.tail;
+                clock_gettime(CLOCK_MONOTONIC, &t0);
+                continue;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t);
+            if((t.tv_sec - t0.tv_sec) * 1000 +
+               (t.tv_nsec - t0.tv_nsec) / 1000000 > TX_STALL_MS) {
+                drop_client();                                  // stalled peer
+                txbuffer.tail = txbuffer.head;                  // flush ring
+                break;
+            }
+        }
     }
 
     txbuffer.data[txbuffer.head] = c;                           // Add data to buffer
@@ -194,18 +221,20 @@ static void rx_poll (void)
 {
     if(listen_fd >= 0) {
 
-        if(client_fd < 0) {
-            int fd = accept(listen_fd, NULL, NULL);
-            if(fd >= 0) {
-                int flags = fcntl(fd, F_GETFL, 0);
-                if(flags != -1)
-                    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-                // Disable Nagle: senders poll with single-byte '?' and
-                // responses are small; Nagle + delayed ACK adds latency.
-                int nodelay = 1;
-                setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-                client_fd = fd;
-            }
+        // Always accept: a new connection displaces any current session
+        // (last connection wins - single-operator machine, and a client
+        // that died without FIN would otherwise hold the port forever).
+        int fd = accept(listen_fd, NULL, NULL);
+        if(fd >= 0) {
+            drop_client();
+            int flags = fcntl(fd, F_GETFL, 0);
+            if(flags != -1)
+                fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            // Disable Nagle: senders poll with single-byte '?' and
+            // responses are small; Nagle + delayed ACK adds latency.
+            int nodelay = 1;
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+            client_fd = fd;
         }
 
         if(client_fd >= 0) {
@@ -216,7 +245,9 @@ static void rx_poll (void)
                     rx_byte(buf[i]);
             } else if(n == 0)
                 drop_client();              // client hung up; keep running
-            // n < 0: EAGAIN (no data) or transient error - ignore
+            else if(errno != EAGAIN && errno != EWOULDBLOCK &&
+                    errno != EINTR)
+                drop_client();              // hard error (reset etc.)
         }
 
     } else {
