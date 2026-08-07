@@ -37,7 +37,6 @@
 #include "serial.h"
 #include "stepper_stream.h"
 #include "glowforge_cooling.h"
-#include "glowforge_homing.h"
 #include "eeprom.h"
 #include "grbl_eeprom_extensions.h"
 
@@ -156,18 +155,21 @@ static void stepperEnable (axes_signals_t enable, bool hold)
 
 /* --- signal backends ------------------------------------------------------ */
 
-/* Limits are the accelerometer bump-detect homing signals: the machine
- * has no physical limit or home switches (glowforge_homing.c). Control
+/* The machine has no limit or home switches; limit-switch homing is the
+ * planned path, and until the switches exist homing stays disabled
+ * (boards/glowforge.h) and the limit signals are stubbed. Control
  * inputs (door/estop) are a later milestone. */
 
 static void limitsEnable (bool on, axes_signals_t homing_cycle)
 {
-    gfhome_enable(on, homing_cycle);
+    (void)on; (void)homing_cycle;
 }
 
 static limit_signals_t limitsGetState (void)
 {
-    return gfhome_get_state();
+    limit_signals_t signals = {0};
+
+    return signals;
 }
 
 static control_signals_t systemGetState (void)
@@ -342,10 +344,9 @@ bool driver_init (void)
 {
     gf_stream_init();
     gfcool_init();
-    gfhome_init();
 
     hal.info = "Glowforge";
-    hal.driver_version = "260803";
+    hal.driver_version = "260807";
     hal.driver_url = "https://github.com/ScottW514/grblHAL-glowforge";
     hal.board = "Glowforge factory control board (i.MX6)";
     hal.driver_setup = driver_setup;

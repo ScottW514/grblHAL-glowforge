@@ -112,11 +112,11 @@ static void serialRxCancel (void)
 }
 
 /* Zero-drain-progress bound before a stalled client is dropped. Output
- * must NEVER block the caller indefinitely: the homing loop writes
- * status reports mid-cycle, and a blocked write here once kept a homing
- * seek streaming into the rail for the length of a wifi stall. On a
- * healthy link the ring drains in microseconds; 100 ms with no progress
- * means the peer is gone or wedged. */
+ * must NEVER block the caller indefinitely: status reports are written
+ * mid-motion, and a blocked write here would stall the protocol thread
+ * for the length of a network stall while the machine keeps moving. On
+ * a healthy link the ring drains in microseconds; 100 ms with no
+ * progress means the peer is gone or wedged. */
 #define TX_STALL_MS 100
 
 static bool serialPutC (const uint8_t c)
