@@ -48,12 +48,17 @@
 // the pulse stream).
 #define DEFAULT_LASER_MODE On
 
-// Homing is disabled: the machine has no limit or home switches yet.
-// Limit-switch homing is the planned path; until the switches exist,
-// $H is rejected and the limit signals are stubbed (driver.c). When
-// homing returns: home corner is the BACK-LEFT of the machine - X min
-// (left) and Y min (+Y physically moves the gantry toward the FRONT,
-// operator-verified) - with the origin forced to the homed position so
-// the workspace is all-positive from that corner; Z homes against the
-// hall sensor only (never blind-drive Z).
+// The machine has no limit or home switches; the operator selects the
+// homing method at runtime (homing_mode in /data/forgefirm.conf, set
+// from the forgectrl web UI - see glowforge_homing.c):
+// - gfcloud: $H runs the Glowforge web-service homing session. The
+//   cloud's camera homing ends with the head at the factory home
+//   position = the BACK-LEFT corner - X min (left), Y min (+Y
+//   physically moves the gantry toward the FRONT, operator-verified) -
+//   which becomes machine origin (workspace all-positive); Z ends at
+//   the top-of-travel hall reference (never blind-drive Z).
+// - switches: $H falls through to the core homing cycle. The core
+//   defaults below keep it disabled until the physical switches exist
+//   (the limit signals are stubbed in driver.c); the same home-corner
+//   convention carries over.
 #define DEFAULT_HOMING_ENABLE Off

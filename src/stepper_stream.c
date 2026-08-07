@@ -88,6 +88,8 @@
 
 static struct {
     bool active;              /* device I/O enabled (GFSINK set) */
+    bool suspended;           /* device handed to another process */
+    const char *dev;          /* pulse device path (GFSINK) */
     int fd;
     uint32_t rate;            /* machine tick = kernel step_freq */
     uint32_t depth;           /* preload/queue depth in bytes (ticks) */
@@ -338,7 +340,7 @@ static void ship_pass (void)
 
     pthread_mutex_lock(&gf.lock);
 
-    if(gf.failed) {
+    if(gf.failed || gf.suspended) {
         pthread_mutex_unlock(&gf.lock);
         return;
     }
@@ -474,6 +476,82 @@ bool gf_stream_fault_take (void)
     return atomic_exchange(&fault_flag, false);
 }
 
+bool gf_stream_suspend (void)
+{
+    if(!gf.active)
+        return true;
+
+    bool idle;
+
+    pthread_mutex_lock(&gf.lock);
+    idle = !gf.streaming && !gf.kernel_running && gf.produced == gf.shipped;
+    if(idle) {
+        /* The kernel may still be playing out its queue (the decel tail
+         * lives there); closing a flock'd fd mid-program is an emergency
+         * stop, so hand over only from a truly idle device. */
+        char state[16] = "";
+        idle = gfio_rd_attr("cnc/state", state, sizeof(state)) == 0 &&
+                strcmp(state, "idle") == 0;
+    }
+    if(idle) {
+        if(gf.hold_pending) {
+            gfio_currents_hold();
+            gf.hold_pending = false;
+        }
+        gf.suspended = true;
+        close(gf.fd);
+        gf.fd = -1;
+    }
+    pthread_mutex_unlock(&gf.lock);
+
+    return idle;
+}
+
+bool gf_stream_resume (void)
+{
+    if(!gf.active)
+        return true;
+
+    /* The previous owner has exited but its fd close can lag; take the
+     * lock non-blocking with a short retry so the protocol thread never
+     * hangs here. */
+    int fd = -1;
+    for(int tries = 0; fd < 0 && tries < 50; tries++) {
+        if((fd = gfio_open_pulse_dev_nb(gf.dev)) < 0)
+            sleep_ns(100000000);   /* 100 ms */
+    }
+    if(fd < 0) {
+        fprintf(stderr, "gfstream: cannot reacquire %s\n", gf.dev);
+        return false;
+    }
+
+    pthread_mutex_lock(&gf.lock);
+    gf.fd = fd;
+
+    /* The homing session reconfigured the machine; re-apply the full
+     * analog config and stream state exactly as at init. */
+    gfio_analog_config();
+    char val[16];
+    snprintf(val, sizeof(val), "%u", gf.rate);
+    bool ok = gfio_wr_attr("cnc/step_freq", val) == 0;
+    lseek(gf.fd, 1, SEEK_SET);        /* clear pulse data + byte counters */
+    gfio_wr_attr("cnc/stop", "1");    /* ack a stale underrun if latched */
+    gfio_wr_attr("cnc/enable", "1");  /* steppers on (idle) */
+
+    gf.produced = gf.shipped = 0;
+    gf.streaming = false;
+    gf.kernel_running = false;
+    gf.hold_pending = false;
+    gf.failed = false;
+    gf.suspended = false;
+    pthread_mutex_unlock(&gf.lock);
+
+    if(!ok)
+        fprintf(stderr, "gfstream: cannot restore step_freq\n");
+
+    return ok;
+}
+
 void gf_stream_init (void)
 {
     const char *dev = getenv("GFSINK"), *opt;
@@ -485,6 +563,7 @@ void gf_stream_init (void)
 
     if(dev != NULL && *dev != '\0') {
 
+        gf.dev = dev;
         if((gf.fd = gfio_open_pulse_dev(dev)) < 0) {
             fprintf(stderr, "gfstream: cannot open %s\n", dev);
             exit(1);
@@ -535,7 +614,7 @@ void gf_stream_shutdown (void)
     pthread_join(gf.producer_tid, NULL);
     pthread_join(gf.shipper_tid, NULL);
 
-    if(gf.active) {
+    if(gf.active && !gf.suspended) {
         gfio_wr_attr("cnc/streaming", "0");
         gfio_wr_attr("cnc/halt", "1");
     }

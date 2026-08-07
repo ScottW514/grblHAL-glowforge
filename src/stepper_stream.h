@@ -35,4 +35,13 @@ void gf_stream_reset (void);
 // write failure). Clears the flag; caller raises the alarm.
 bool gf_stream_fault_take (void);
 
+// Hand the pulse device to another process (the gfcloud homing runner)
+// and take it back. Suspend succeeds only from a fully idle stream AND
+// kernel (closing the flock'd fd mid-program is an emergency stop) -
+// callers retry until it returns true. Resume reopens the device and
+// re-applies the analog config, step_freq and stream state; false =
+// device lost (raise an alarm). Both are no-ops in null-sink mode.
+bool gf_stream_suspend (void);
+bool gf_stream_resume (void);
+
 void gf_stream_shutdown (void);

@@ -37,6 +37,7 @@
 #include "serial.h"
 #include "stepper_stream.h"
 #include "glowforge_cooling.h"
+#include "glowforge_homing.h"
 #include "eeprom.h"
 #include "grbl_eeprom_extensions.h"
 
@@ -155,9 +156,11 @@ static void stepperEnable (axes_signals_t enable, bool hold)
 
 /* --- signal backends ------------------------------------------------------ */
 
-/* The machine has no limit or home switches; limit-switch homing is the
- * planned path, and until the switches exist homing stays disabled
- * (boards/glowforge.h) and the limit signals are stubbed. Control
+/* The machine has no limit or home switches. $H is dispatched by homing
+ * mode (glowforge_homing.c): gfcloud runs the Glowforge web-service
+ * homing session, switches falls through to the core cycle once the
+ * planned physical switches exist - until then the limit signals are
+ * stubbed and core homing stays disabled (boards/glowforge.h). Control
  * inputs (door/estop) are a later milestone. */
 
 static void limitsEnable (bool on, axes_signals_t homing_cycle)
@@ -344,6 +347,7 @@ bool driver_init (void)
 {
     gf_stream_init();
     gfcool_init();
+    gfhome_init();
 
     hal.info = "Glowforge";
     hal.driver_version = "260807";

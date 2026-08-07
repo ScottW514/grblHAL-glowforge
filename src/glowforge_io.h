@@ -15,8 +15,10 @@ int gfio_wr_attr (const char *attr, const char *val);
 int gfio_rd_attr (const char *attr, char *buf, size_t len);
 
 // Open the pulse device and take the exclusive flock (the kernel dead
-// man's switch). Returns the fd, or -1.
+// man's switch). Returns the fd, or -1. The _nb variant fails instead
+// of blocking when another process still holds the lock.
 int gfio_open_pulse_dev (const char *path);
+int gfio_open_pulse_dev_nb (const char *path);
 
 // Factory analog machine config (print-header ground truth): x8 XY
 // microstepping, slow-decay mode, Z locked in the pulse stream, laser

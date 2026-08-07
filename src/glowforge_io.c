@@ -55,19 +55,29 @@ int gfio_rd_attr (const char *attr, char *buf, size_t len)
     return 0;
 }
 
-int gfio_open_pulse_dev (const char *path)
+static int open_pulse_dev (const char *path, int lock_flags)
 {
     int fd;
 
     if((fd = open(path, O_WRONLY)) < 0)
         return -1;
 
-    if(flock(fd, LOCK_EX) != 0) {
+    if(flock(fd, lock_flags) != 0) {
         close(fd);
         return -1;
     }
 
     return fd;
+}
+
+int gfio_open_pulse_dev (const char *path)
+{
+    return open_pulse_dev(path, LOCK_EX);
+}
+
+int gfio_open_pulse_dev_nb (const char *path)
+{
+    return open_pulse_dev(path, LOCK_EX | LOCK_NB);
 }
 
 void gfio_analog_config (void)
