@@ -20,3 +20,9 @@ void serial_set_listen_fd (int fd);
 // protocol thread (chained on grbl.on_execute_realtime and called from
 // blocking delays).
 void serial_poll (void);
+
+// Pace the protocol loop: flush pending TX, then block until serial
+// traffic needs service or the timeout expires. Wakes instantly on a new
+// connection, client RX, or (while output is pending) TX writability, so
+// a coarse idle timeout adds no input latency. Protocol thread only.
+void serial_wait (long timeout_us);

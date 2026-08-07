@@ -20,6 +20,8 @@
   SPDX-License-Identifier: GPL-3.0-or-later
 */
 
+#define _GNU_SOURCE     /* ppoll */
+
 // grbl headers first: glibc's <sys/stat.h> (via fcntl.h) defines st_mtime
 // as a macro, which must not be in scope when the core's vfs.h declares
 // its struct field of the same name.
@@ -34,6 +36,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -45,6 +48,13 @@ static enqueue_realtime_command_ptr enqueue_realtime_command = protocol_enqueue_
 
 static int listen_fd = -1;
 static int client_fd = -1;
+static bool stdin_eof = false;  /* stdio mode: stop polling stdin at EOF */
+
+/* Bytes rx_poll() reads from the client per call; serial_wait() only arms
+ * client RX while the ring has room for a full read, so a sender that
+ * ignores flow control gets paced by the timeout instead of spinning the
+ * protocol loop. */
+#define RX_CHUNK 64
 
 void serial_set_listen_fd (int fd)
 {
@@ -238,7 +248,7 @@ static void rx_poll (void)
         }
 
         if(client_fd >= 0) {
-            uint8_t buf[64];
+            uint8_t buf[RX_CHUNK];
             ssize_t n = read(client_fd, buf, sizeof(buf));
             if(n > 0) {
                 for(ssize_t i = 0; i < n; i++)
@@ -254,6 +264,8 @@ static void rx_poll (void)
         uint8_t c = platform_poll_stdin();
         if(c && c != 0xFF)
             rx_byte(c);
+        else if(c == 0xFF)
+            stdin_eof = true;   /* stop arming stdin in serial_wait() */
     }
 }
 
@@ -290,4 +302,38 @@ void serial_poll (void)
 {
     rx_poll();
     tx_drain();
+}
+
+void serial_wait (long timeout_us)
+{
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = timeout_us * 1000 };
+    struct pollfd fds[2];
+    nfds_t n = 0;
+
+    tx_drain();     /* flush this iteration's output before blocking */
+
+    if(listen_fd >= 0) {
+        fds[n].fd = listen_fd;
+        fds[n].events = POLLIN;
+        n++;
+        if(client_fd >= 0) {
+            fds[n].fd = client_fd;
+            fds[n].events =
+                (serialRxFree() > RX_CHUNK ? POLLIN : 0) |
+                (txbuffer.tail != txbuffer.head ? POLLOUT : 0);
+            n++;
+        }
+    } else if(!stdin_eof) {
+        fds[n].fd = STDIN_FILENO;
+        fds[n].events = POLLIN;
+        n++;
+    }
+
+    /* No fd to wait on (stdio mode at EOF), or a ppoll failure that is
+     * not a signal wakeup: plain sleep so pacing can never become a
+     * busy spin. */
+    if(n == 0)
+        nanosleep(&ts, NULL);
+    else if(ppoll(fds, n, &ts, NULL) < 0 && errno != EINTR)
+        nanosleep(&ts, NULL);
 }

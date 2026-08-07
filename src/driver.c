@@ -86,12 +86,6 @@ static uint64_t micros (void)
     return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
-static void sleep_us (long us)
-{
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = us * 1000 };
-    nanosleep(&ts, NULL);
-}
-
 static void driver_delay_ms (uint32_t ms, void (*callback)(void))
 {
     if(ms > 0) {
@@ -101,11 +95,12 @@ static void driver_delay_ms (uint32_t ms, void (*callback)(void))
         } else {
             /* Blocking delay on the protocol thread. RX is polled, not
              * interrupt-driven, so keep polling here or a G4/tool-change
-             * wait would blind real-time commands for its whole span. */
+             * wait would blind real-time commands for its whole span
+             * (serial_wait wakes early on traffic). */
             uint32_t until = millis() + ms;
             while((int32_t)(until - millis()) > 0) {
+                serial_wait(1000);
                 serial_poll();
-                sleep_us(1000);
             }
         }
     } else if(callback)
@@ -298,12 +293,10 @@ static void driverReset (void)
 
 /* Realtime hook, chained on grbl.on_execute_realtime: everything the
  * driver must do periodically on the protocol thread. Also paces the
- * loop - without a sleep the protocol thread busy-spins and starves the
+ * loop - without a wait the protocol thread busy-spins and starves the
  * rest of the single-core i.MX6. */
 static void glowforge_process_realtime (uint_fast16_t state)
 {
-    serial_poll();
-
     if(delay_callback && (int32_t)(millis() - delay_deadline_ms) >= 0) {
         void (*cb)(void) = delay_callback;
         delay_callback = NULL;
@@ -320,7 +313,17 @@ static void glowforge_process_realtime (uint_fast16_t state)
     if(exit_requested && state != STATE_CYCLE && state != STATE_JOG && state != STATE_HOMING)
         exit(EXIT_SUCCESS);
 
-    sleep_us(state == STATE_IDLE || state == STATE_ALARM ? 1000 : 200);
+    /* serial_wait blocks on the serial fds, waking instantly on traffic,
+     * so the idle tick can be coarse without adding input latency. A
+     * pending delay callback keeps a 1 ms tick for its deadline; motion
+     * states keep the tight pace for the stream feeder's sake. The wait
+     * comes BEFORE serial_poll so bytes that wake it are serviced now -
+     * the core then acts on them in the protocol pass that follows this
+     * hook (a '?' answers in the next pass, not after another tick). */
+    serial_wait(state == STATE_IDLE || state == STATE_ALARM
+                 ? (delay_callback ? 1000 : 10000) : 200);
+
+    serial_poll();
 
     on_execute_realtime(state);
 }
