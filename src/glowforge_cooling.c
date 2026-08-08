@@ -5,7 +5,10 @@
   the factory's own numbers (captured pulse-file headers + settings map):
   fan duties AAid=204/AArd=1023, EFrd=65535, IFrd=43278; coolant windows
   CM* in millidegrees - run ceiling 33 C (CMrx), start/resume gate 31 C
-  (CMwx), idle max 50 C. All thresholds env-adjustable.
+  (CMwx), idle max 50 C. All thresholds user-tunable: cool_* keys in
+  the shared machine config (forgectrl Machine tab, re-read per flood
+  start), GFCOOL_* env vars as bench overrides that win for the
+  process lifetime.
 
   Policy:
   - IDLE: pump on, TEC off, purge on, fans at factory idle, HEATER OFF
@@ -328,28 +331,65 @@ static void warn (const char *msg)
     fprintf(stderr, "gfcool: %s\n", msg);
 }
 
+/* Tunables resolve env > conf > compiled default. The GFCOOL_* env
+ * vars are the bench-debug path and win for the process lifetime; the
+ * cool_* keys in the shared machine config are the user-facing store
+ * (forgectrl Machine tab) and are re-read at every flood start, so GUI
+ * changes apply from the next job with no restart. */
+static struct {
+    const char *env, *key;
+    float def;
+    float *f;                       /* exactly one of f/u is set */
+    uint32_t *u;
+    bool env_set;
+} tunables[] = {
+    { "GFCOOL_FLOW_HEATER_PCT", "cool_flow_heater_pct",
+      FLOW_HEATER_PCT,        NULL,            &flow_heater_pct },
+    { "GFCOOL_FLOW_CHECK_S",    "cool_flow_check_s",
+      FLOW_CHECK_S,           NULL,            &flow_check_s },
+    { "GFCOOL_RECHECK_S",       "cool_recheck_s",
+      FLOW_RECHECK_S,         NULL,            &flow_recheck_s },
+    { "GFCOOL_COOLDOWN_S",      "cool_cooldown_s",
+      COOLDOWN_SMOKE_S,       NULL,            &smoke_s },
+    { "GFCOOL_COOLDOWN_MAX_S",  "cool_cooldown_max_s",
+      COOLDOWN_MAX_S,         NULL,            &cooldown_max_s },
+    { "GFCOOL_TEMP_MAX",        "cool_temp_max",
+      TEMP_MAX_C_DEFAULT,     &temp_max_c,     NULL },
+    { "GFCOOL_TEMP_RESUME",     "cool_temp_resume",
+      TEMP_RESUME_C_DEFAULT,  &temp_resume_c,  NULL },
+    { "GFCOOL_FLOW_RISE",       "cool_flow_rise",
+      FLOW_FAULT_RISE_C,      &flow_fault_rise, NULL },
+    { "GFCOOL_CONFIRM_MAX_S",   "cool_confirm_max_s",
+      FLOW_CONFIRM_MAX_S,     NULL,            &confirm_max_s },
+};
+
+static void cool_conf_reload (void)
+{
+    for(size_t i = 0; i < sizeof(tunables) / sizeof(tunables[0]); i++) {
+        if(tunables[i].env_set)
+            continue;
+        float v = gfio_conf_read_float(tunables[i].key, tunables[i].def);
+        if(tunables[i].f)
+            *tunables[i].f = v;
+        else
+            *tunables[i].u = v < 0.0f ? 0 : (uint32_t)v;
+    }
+}
+
 void gfcool_init (void)
 {
     const char *opt;
 
-    if((opt = getenv("GFCOOL_FLOW_HEATER_PCT")))
-        flow_heater_pct = (uint32_t)atoi(opt);
-    if((opt = getenv("GFCOOL_FLOW_CHECK_S")))
-        flow_check_s = (uint32_t)atoi(opt);
-    if((opt = getenv("GFCOOL_RECHECK_S")))
-        flow_recheck_s = (uint32_t)atoi(opt);
-    if((opt = getenv("GFCOOL_COOLDOWN_S")))
-        smoke_s = (uint32_t)atoi(opt);
-    if((opt = getenv("GFCOOL_COOLDOWN_MAX_S")))
-        cooldown_max_s = (uint32_t)atoi(opt);
-    if((opt = getenv("GFCOOL_TEMP_MAX")))
-        temp_max_c = (float)atof(opt);
-    if((opt = getenv("GFCOOL_TEMP_RESUME")))
-        temp_resume_c = (float)atof(opt);
-    if((opt = getenv("GFCOOL_FLOW_RISE")))
-        flow_fault_rise = (float)atof(opt);
-    if((opt = getenv("GFCOOL_CONFIRM_MAX_S")))
-        confirm_max_s = (uint32_t)atoi(opt);
+    for(size_t i = 0; i < sizeof(tunables) / sizeof(tunables[0]); i++) {
+        if((opt = getenv(tunables[i].env))) {
+            tunables[i].env_set = true;
+            if(tunables[i].f)
+                *tunables[i].f = (float)atof(opt);
+            else
+                *tunables[i].u = (uint32_t)atoi(opt);
+        }
+    }
+    cool_conf_reload();
 
     gfio_wr_attr("thermal/water_pump_on", "1");
     gfio_wr_attr("thermal/tec_on", "0");
@@ -365,6 +405,7 @@ void gfcool_coolant_set (coolant_state_t state)
     coolant_reported = state;
 
     if(state.flood) {
+        cool_conf_reload();             /* GUI changes apply per job */
         cool_state = Cool_Run;
         fans_run();
         if(flow_verdict == Flow_Suspect)

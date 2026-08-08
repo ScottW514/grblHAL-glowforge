@@ -7,8 +7,10 @@
   SPDX-License-Identifier: GPL-3.0-or-later
 */
 
+#include <ctype.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <unistd.h>
@@ -101,4 +103,60 @@ void gfio_currents_hold (void)
 {
     gfio_wr_attr("pic/x_step_current", X_CURRENT_HOLD);
     gfio_wr_attr("pic/y_step_current", Y_CURRENT_HOLD);
+}
+
+/* --- the shared machine config ("key = value", '#' comments) --------- */
+
+#define CONF_DEFAULT "/data/forgefirm.conf"
+
+static const char *conf_path (void)
+{
+    const char *p = getenv("GFHOME_CONF");
+    return (p && *p) ? p : CONF_DEFAULT;
+}
+
+int gfio_conf_read (const char *key, char *val, size_t len)
+{
+    FILE *f = fopen(conf_path(), "r");
+    if(f == NULL)
+        return -1;
+
+    char line[256];
+    int found = -1;
+    while(fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while(isspace((unsigned char)*p))
+            p++;
+        if(*p == '#' || *p == '\0')
+            continue;
+        char *eq = strchr(p, '=');
+        if(eq == NULL)
+            continue;
+        char *k_end = eq;
+        while(k_end > p && isspace((unsigned char)k_end[-1]))
+            k_end--;
+        *k_end = '\0';
+        if(strcmp(p, key))
+            continue;
+        char *v = eq + 1;
+        while(isspace((unsigned char)*v))
+            v++;
+        char *v_end = v + strlen(v);
+        while(v_end > v && isspace((unsigned char)v_end[-1]))
+            v_end--;
+        *v_end = '\0';
+        snprintf(val, len, "%s", v);
+        found = 0;                  /* keep scanning: last occurrence wins */
+    }
+    fclose(f);
+    return found;
+}
+
+float gfio_conf_read_float (const char *key, float fallback)
+{
+    char val[32], *end;
+    if(gfio_conf_read(key, val, sizeof(val)) != 0)
+        return fallback;
+    float f = strtof(val, &end);
+    return end == val ? fallback : f;
 }

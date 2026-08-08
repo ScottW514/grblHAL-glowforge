@@ -29,3 +29,11 @@ void gfio_analog_config (void);
 // Factory run/idle current scheme: full torque only while motion plays.
 void gfio_currents_run (void);
 void gfio_currents_hold (void);
+
+// The shared machine config /data/forgefirm.conf ("key = value" lines,
+// '#' comments; GFHOME_CONF overrides the path). Written by the
+// forgectrl web UI; consumers re-read at their natural boundaries
+// (homing per $H, cooling per flood start). Returns 0 when the key
+// exists; the float variant falls back on a missing or unparsable key.
+int gfio_conf_read (const char *key, char *val, size_t len);
+float gfio_conf_read_float (const char *key, float fallback);

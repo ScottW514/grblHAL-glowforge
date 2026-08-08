@@ -61,7 +61,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define CONF_DEFAULT      "/data/forgefirm.conf"
 #define CMD_DEFAULT       "/usr/sbin/gfhome.py"
 #define TIMEOUT_S_DEFAULT 300.0f
 #define SUSPEND_WAIT_MS   3000     /* decel tail + hold-current drop */
@@ -75,59 +74,10 @@
  * counters), or a stream fault. */
 #define HOMED_ANCHOR      "/run/grblhal.homed"
 
-/* --- /data/forgefirm.conf: "key = value" lines, '#' comments --------- */
-
-static const char *conf_path (void)
-{
-    const char *p = getenv("GFHOME_CONF");
-    return (p && *p) ? p : CONF_DEFAULT;
-}
-
-static int cfg_read (const char *key, char *val, size_t len)
-{
-    FILE *f = fopen(conf_path(), "r");
-    if(f == NULL)
-        return -1;
-
-    char line[256];
-    int found = -1;
-    while(fgets(line, sizeof(line), f)) {
-        char *p = line;
-        while(isspace((unsigned char)*p))
-            p++;
-        if(*p == '#' || *p == '\0')
-            continue;
-        char *eq = strchr(p, '=');
-        if(eq == NULL)
-            continue;
-        char *k_end = eq;
-        while(k_end > p && isspace((unsigned char)k_end[-1]))
-            k_end--;
-        *k_end = '\0';
-        if(strcmp(p, key))
-            continue;
-        char *v = eq + 1;
-        while(isspace((unsigned char)*v))
-            v++;
-        char *v_end = v + strlen(v);
-        while(v_end > v && isspace((unsigned char)v_end[-1]))
-            v_end--;
-        *v_end = '\0';
-        snprintf(val, len, "%s", v);
-        found = 0;                  /* keep scanning: last occurrence wins */
-    }
-    fclose(f);
-    return found;
-}
-
-static float cfg_read_float (const char *key, float fallback)
-{
-    char val[32], *end;
-    if(cfg_read(key, val, sizeof(val)) != 0)
-        return fallback;
-    float f = strtof(val, &end);
-    return end == val ? fallback : f;
-}
+/* The "key = value" config parser lives in glowforge_io (shared with
+ * the cooling tunables); these are kept as local names only. */
+#define cfg_read       gfio_conf_read
+#define cfg_read_float gfio_conf_read_float
 
 void gfhome_invalidate (void)
 {
