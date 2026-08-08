@@ -160,12 +160,21 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
 
     fprintf(stderr, "gfhome: starting homing session: %s\n", cmd);
 
+    /* Hand the runner its share of the budget so it gives up before the
+     * SIGTERM deadline. Set pre-fork (env calls are not async-signal-
+     * safe in the child); every getenv user runs on this thread. */
+    char budget[16];
+    snprintf(budget, sizeof(budget), "%u",
+             timeout_ms > 60000 ? timeout_ms / 1000 - 30 : 30);
+    setenv("GFHOME_TIMEOUT_S", budget, 1);
+
     pid_t pid = fork();
     if(pid == 0) {
         setpgid(0, 0);   /* own process group: SIGTERM reaches the whole tree */
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
+    unsetenv("GFHOME_TIMEOUT_S");
     if(pid < 0) {
         fprintf(stderr, "gfhome: cannot spawn the homing runner\n");
         if(!gf_stream_resume())
