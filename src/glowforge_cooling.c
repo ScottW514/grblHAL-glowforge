@@ -15,11 +15,20 @@
   - RUN (M8, LightBurn's per-layer air assist): cut-profile fans, plus
     periodic coolant-flow verification. The flow heater sits between
     the two water-temp sensors; each check runs it at FLOW_HEATER_PCT
-    for FLOW_CHECK_S and faults if the downstream sensor rises more
-    than FLOW_FAULT_RISE_C (flowing coolant carries the heat away; a
-    stagnant loop cooks the downstream sensor). Checks repeat every
-    FLOW_RECHECK_S and start only from a thermally settled loop; the
-    constants below carry the measured rationale.
+    for FLOW_CHECK_S and reads how far the downstream sensor climbs
+    (flowing coolant carries the heat away; a stagnant loop cooks the
+    downstream sensor). Checks repeat every FLOW_RECHECK_S and start
+    only from a thermally settled loop; the constants below carry the
+    measured rationale. An over-limit reading is a SUSPICION, not a
+    fault: it warns and requests an immediate re-check, and only a
+    second consecutive over-limit (no clean check in between,
+    whatever the wall-clock gap) - or a suspicion the loop cannot
+    resolve within FLOW_CONFIRM_MAX_S - raises COOLANT FLOW FAULT.
+    A clean re-check clears the suspicion: transient events (a pump
+    airlock burp, disturbed coolant) self-clear within minutes, while
+    true stagnation cannot pass a settled re-check. Cleared
+    suspicions still count - FLOW_TREND_N of them in one job earn an
+    aggregated check-your-coolant warning.
   - COOLDOWN (M9): 15 s smoke-clear at run duty, then a thermal phase at
     reduced duty (fan airflow measurably cools the loop) until the
     upstream temp is back under the resume gate or a timeout expires;
@@ -31,7 +40,9 @@
     see the Hold state and the [MSG:Warning:...] lines.
 
   The laser milestone upgrades the flow fault and the temperature gates
-  from warnings/holds into hard fire interlocks.
+  from warnings/holds into hard fire interlocks; a flow suspicion will
+  then also take the safe posture (hold, laser off, forced cooling)
+  while its re-check decides.
 
   Copyright (c) 2026 Scott Wiederhold <s.e.wiederhold@gmail.com>
   SPDX-License-Identifier: GPL-3.0-or-later
@@ -141,6 +152,20 @@
  * GFCOOL_FLOW_RISE overrides. */
 #define FLOW_FAULT_RISE_C  14.4f
 
+/* A suspicion must resolve. With flow, the check's own heat sheds in
+ * under a minute and the confirming verdict lands 2-4 min after the
+ * suspect one; with a truly dead pump the cooked region needs ~3-5 min
+ * of conduction-only decay before the settle gate reopens, and the
+ * re-check then reads stagnant again. A loop that cannot produce any
+ * verdict inside this budget has shown no evidence of health and is
+ * treated as faulted. The budget restarts with each flood session -
+ * checks cannot run outside one. GFCOOL_CONFIRM_MAX_S overrides. */
+#define FLOW_CONFIRM_MAX_S 480
+/* Cleared suspicions per job that earn an aggregated warning: each one
+ * was disproven by its re-check, but several in a single job point at
+ * a marginal pump or recurring airlock. */
+#define FLOW_TREND_N       3
+
 typedef enum {
     Cool_Idle = 0,
     Cool_Run,
@@ -170,6 +195,20 @@ static float flow_base_down;
 static double flow_establish_at, flow_check_end;
 static float flow_dt_sum;
 static uint32_t flow_dt_n;
+
+/* One over-limit reading opens a suspicion; the next completed check
+ * decides it, whenever that is - "consecutive" means no clean check in
+ * between, not close in time. */
+typedef enum {
+    Flow_Normal = 0,
+    Flow_Suspect,       /* one over-limit; the re-check decides */
+    Flow_Fault,         /* consecutive over-limits, or a starved re-check */
+} flow_verdict_t;
+
+static flow_verdict_t flow_verdict = Flow_Normal;
+static double flow_suspect_since;
+static uint32_t confirm_max_s = FLOW_CONFIRM_MAX_S;
+static uint32_t flow_episodes = 0;  /* cleared suspicions this job */
 
 static double phase_until;         /* smoke end / thermal timeout */
 static double next_temp_check;
@@ -309,6 +348,8 @@ void gfcool_init (void)
         temp_resume_c = (float)atof(opt);
     if((opt = getenv("GFCOOL_FLOW_RISE")))
         flow_fault_rise = (float)atof(opt);
+    if((opt = getenv("GFCOOL_CONFIRM_MAX_S")))
+        confirm_max_s = (uint32_t)atoi(opt);
 
     gfio_wr_attr("thermal/water_pump_on", "1");
     gfio_wr_attr("thermal/tec_on", "0");
@@ -326,6 +367,8 @@ void gfcool_coolant_set (coolant_state_t state)
     if(state.flood) {
         cool_state = Cool_Run;
         fans_run();
+        if(flow_verdict == Flow_Suspect)
+            flow_suspect_since = wall_s();  /* budget is per flood session */
         /* Request a check at job start; the poll starts it once the
          * loop is settled, then repeats it on the re-check cadence. */
         if(flow_check_s > 0 && !flow_check_active && !flow_check_pending) {
@@ -436,7 +479,7 @@ void gfcool_poll (void)
         if(now >= flow_check_end) {
             float rise = down - flow_base_down;
             float dt = flow_dt_n ? flow_dt_sum / (float)flow_dt_n : 0.0f;
-            char msg[96];
+            char msg[112];
 
             flow_check_active = false;
             heater_set_pct(0);
@@ -444,10 +487,40 @@ void gfcool_poll (void)
             flow_next_check = now + (double)flow_recheck_s;
 
             if(rise > flow_fault_rise) {
-                snprintf(msg, sizeof(msg),
-                         "COOLANT FLOW FAULT: heater rise %.1f C (limit %.1f, dT %.1f) - check the pump",
-                         rise, flow_fault_rise, dt);
+                if(flow_verdict == Flow_Normal) {
+                    /* First over-limit: open a suspicion and re-check
+                     * as soon as the loop settles instead of waiting
+                     * out the cadence. */
+                    flow_verdict = Flow_Suspect;
+                    flow_suspect_since = now;
+                    flow_check_pending = true;
+                    flow_pending_since = now;
+                    flow_settle_warned = false;
+                    snprintf(msg, sizeof(msg),
+                             "COOLANT FLOW SUSPECT: heater rise %.1f C (limit %.1f, dT %.1f) - re-checking",
+                             rise, flow_fault_rise, dt);
+                } else {
+                    flow_verdict = Flow_Fault;
+                    snprintf(msg, sizeof(msg),
+                             "COOLANT FLOW FAULT: heater rise %.1f C (limit %.1f, dT %.1f) - check the pump",
+                             rise, flow_fault_rise, dt);
+                }
                 warn(msg);
+            } else if(flow_verdict != Flow_Normal) {
+                snprintf(msg, sizeof(msg),
+                         flow_verdict == Flow_Suspect
+                           ? "coolant flow suspicion cleared (heater rise %.1f C, dT %.1f C)"
+                           : "coolant flow recovered (heater rise %.1f C, dT %.1f C)",
+                         rise, dt);
+                flow_verdict = Flow_Normal;
+                report_message(msg, Message_Info);
+                fprintf(stderr, "gfcool: %s\n", msg);
+                if(++flow_episodes == FLOW_TREND_N) {
+                    snprintf(msg, sizeof(msg),
+                             "%u coolant flow suspicions this job - check the pump and coolant level",
+                             (unsigned)flow_episodes);
+                    warn(msg);
+                }
             } else {
                 snprintf(msg, sizeof(msg),
                          "coolant flow verified (heater rise %.1f C, dT %.1f C)", rise, dt);
@@ -460,6 +533,21 @@ void gfcool_poll (void)
         flow_check_pending = true;  /* periodic re-interrogation mid-job */
         flow_pending_since = now;
         flow_settle_warned = false;
+    }
+
+    /* A suspicion may not sit unresolved while a job runs: no verdict
+     * within the budget (settle gate starved - itself consistent with
+     * stagnation, which decays by conduction only) fails safe. An
+     * in-flight check is left to deliver its real verdict instead. */
+    if(flow_verdict == Flow_Suspect && !flow_check_active
+       && cool_state == Cool_Run
+       && now - flow_suspect_since > (double)confirm_max_s) {
+        char msg[96];
+        flow_verdict = Flow_Fault;
+        snprintf(msg, sizeof(msg),
+                 "COOLANT FLOW FAULT: no clean re-check within %u s - check the pump",
+                 (unsigned)confirm_max_s);
+        warn(msg);
     }
 
     /* Track downstream history for the stationarity test below. It is
@@ -510,6 +598,7 @@ phases:
         } else {
             cool_state = Cool_Idle;
             fans_idle();
+            flow_episodes = 0;
         }
     } else if(cool_state == Cool_Thermal) {
         float up2;
@@ -519,6 +608,7 @@ phases:
                 warn("thermal cooldown timed out above the resume gate");
             cool_state = Cool_Idle;
             fans_idle();
+            flow_episodes = 0;
         }
     }
 }
