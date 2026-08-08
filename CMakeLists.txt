@@ -14,6 +14,9 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # protocol thread; keep type-punning-heavy embedded code out of
     # strict-aliasing territory.
     add_compile_options(-fno-strict-aliasing)
+    # An implicitly declared function returning float reads the wrong
+    # register on the hard-float target; make the whole class a hard error.
+    add_compile_options(-Werror=implicit-function-declaration)
 endif()
 
 # Machine configuration: my_machine.h (-> boards/glowforge.h) is force-

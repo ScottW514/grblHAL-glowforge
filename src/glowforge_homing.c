@@ -42,6 +42,7 @@
  * macro that would otherwise mangle the field of that name in vfs.h */
 #include "driver.h"
 #include "glowforge_homing.h"
+#include "glowforge_io.h"
 #include "stepper_stream.h"
 #include "serial.h"
 
