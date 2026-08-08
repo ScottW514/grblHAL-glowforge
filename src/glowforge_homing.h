@@ -11,3 +11,7 @@
 // the homing_mode key in /data/forgefirm.conf, GFHOME_CONF overrides
 // the path). Called from driver_init().
 void gfhome_init (void);
+
+// Drop the /run position anchor: the homed reference is no longer
+// trustworthy (stream fault, position lost). Homing success rewrites it.
+void gfhome_invalidate (void);

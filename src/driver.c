@@ -310,6 +310,7 @@ static void glowforge_process_realtime (uint_fast16_t state)
 
     if(gf_stream_fault_take()) {
         fprintf(stderr, "gfstream: stream fault - raising alarm, re-home required\n");
+        gfhome_invalidate();
         system_raise_alarm(Alarm_MotorFault);
     }
 

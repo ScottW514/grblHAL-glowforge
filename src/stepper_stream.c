@@ -476,6 +476,14 @@ bool gf_stream_fault_take (void)
     return atomic_exchange(&fault_flag, false);
 }
 
+void gf_stream_clear_position (void)
+{
+    pthread_mutex_lock(&gf.lock);
+    if(gf.active && gf.fd >= 0)
+        lseek(gf.fd, 2, SEEK_SET);   /* clear the kernel position counters */
+    pthread_mutex_unlock(&gf.lock);
+}
+
 bool gf_stream_suspend (void)
 {
     if(!gf.active)

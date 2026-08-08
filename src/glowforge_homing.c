@@ -67,6 +67,14 @@
 #define SUSPEND_WAIT_MS   3000     /* decel tail + hold-current drop */
 #define KILL_GRACE_MS     5000
 
+/* Position anchor for external status readers (forgectrl): written on
+ * homing success, right after the kernel position counters are zeroed,
+ * so anchor + counters = machine position from then on. Removed
+ * whenever the reference stops being trustworthy: controller start, a
+ * homing session starting (the runner moves the machine and clears the
+ * counters), or a stream fault. */
+#define HOMED_ANCHOR      "/run/grblhal.homed"
+
 /* --- /data/forgefirm.conf: "key = value" lines, '#' comments --------- */
 
 static const char *conf_path (void)
@@ -121,6 +129,21 @@ static float cfg_read_float (const char *key, float fallback)
     return end == val ? fallback : f;
 }
 
+void gfhome_invalidate (void)
+{
+    unlink(HOMED_ANCHOR);
+}
+
+static void anchor_write (const float *home)
+{
+    FILE *f = fopen(HOMED_ANCHOR, "w");
+    if(f) {
+        fprintf(f, "%.3f %.3f %.3f\n",
+                home[X_AXIS], home[Y_AXIS], home[Z_AXIS]);
+        fclose(f);
+    }
+}
+
 /* --- session orchestration -------------------------------------------- */
 
 /* Pump the protocol while blocked in the session: flush/collect serial
@@ -143,6 +166,7 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
         (uint32_t)(cfg_read_float("gfcloud_home_timeout_s", TIMEOUT_S_DEFAULT) * 1000.0f);
 
     state_set(STATE_HOMING);
+    gfhome_invalidate();   /* the session moves the machine */
 
     /* Hand the pulse device over; a just-finished move may still be
      * playing out its decel tail in the kernel. */
@@ -255,6 +279,9 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
     sys.homed.mask = X_AXIS_BIT|Y_AXIS_BIT|Z_AXIS_BIT;
     sync_position();
 
+    gf_stream_clear_position();
+    anchor_write(home);
+
     if(grbl.on_homing_completed)
         grbl.on_homing_completed(
             (axes_signals_t){ .mask = X_AXIS_BIT|Y_AXIS_BIT|Z_AXIS_BIT }, true);
@@ -296,5 +323,6 @@ static sys_commands_t homing_commands = {
 
 void gfhome_init (void)
 {
+    gfhome_invalidate();   /* a fresh controller is not homed */
     system_register_commands(&homing_commands);
 }

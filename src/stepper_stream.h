@@ -35,6 +35,10 @@ void gf_stream_reset (void);
 // write failure). Clears the flag; caller raises the alarm.
 bool gf_stream_fault_take (void);
 
+// Zero the kernel position counters (homing established a reference;
+// external status readers add the home offset to the counters).
+void gf_stream_clear_position (void);
+
 // Hand the pulse device to another process (the gfcloud homing runner)
 // and take it back. Suspend succeeds only from a fully idle stream AND
 // kernel (closing the flock'd fd mid-program is an emergency stop) -
