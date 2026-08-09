@@ -10,8 +10,26 @@
   Y_STEP, bit3 Y_DIR (set = +Y), bit5 Z_STEP, bit6 Z_DIR (set = +Z, lens
   up); streaming=1 while live-feeding (underrun is fault-like), cleared
   before the terminal end-of-data; the fd stays open and flock'd for the
-  process lifetime (kernel dead man's switch). MOTION ONLY: bit 4 (laser)
-  is never set and the laser latch is forced locked at init.
+  process lifetime (kernel dead man's switch).
+
+  Laser (bit 4 FIRE + bit-7 power bytes): the producer records power/
+  fire transitions on the same tick grid as the steps (gf_stream_laser,
+  called from the core's per-segment spindle update under the core
+  lock); the shipper applies them as it emits - a power byte
+  (0x80 | duty) ahead of the first tick byte the transition covers,
+  then the FIRE bit OR'd into every tick byte while fire is on.
+  Contract rules handled here: a power byte costs NO machine tick (the
+  SDMA script processes the following byte in the same EPIT interrupt,
+  so power bytes are extra stream bytes that leave the tick/due math
+  untouched); consecutive power bytes would be dropped by the script
+  (transitions are coalesced per tick, so a power byte always has a
+  tick byte directly behind it); and every plain run start resets the
+  hardware duty to ~100%, so a power byte leads every kernel run before
+  any fire bit can occur. Arming policy lives in glowforge_laser.c: the
+  kernel laser latch stays locked except inside an operator-armed job
+  window, and while armed an underrun faults instead of the stop/run
+  retry (a restarted run resets the duty - queued fire bits would
+  replay at ~full power).
 
   Threading model (three actors):
 
@@ -63,6 +81,11 @@
 
 #include "grbl/hal.h"
 
+/* After the grbl headers: glibc's stat.h (via fcntl.h) defines an
+ * st_mtime macro that would otherwise mangle the field of that name in
+ * vfs.h. */
+#include <fcntl.h>
+
 /* Stream ring: 1 << 17 = 131072 machine ticks of headroom (4.6 s @ 28160).
  * With the producer wall-paced the lead over the shipped cursor stays near
  * the preload depth; the guard below is a belt-and-braces failsafe. */
@@ -86,11 +109,26 @@
 /* Shipper cadence. */
 #define SHIP_PERIOD_NS 10000000 /* 10 ms */
 
+/* Laser transition queue: must cover the transitions in flight between
+ * the producer and the shipped cursor (~preload depth of stream time).
+ * Grayscale engraving is the heavy case - a power change per pixel can
+ * queue hundreds across a 200 ms window. */
+#define LEV_BITS 12
+#define LEV_N (1u << LEV_BITS)   /* 4096 */
+#define LEV_MASK (LEV_N - 1)
+
+struct laser_ev {
+    uint64_t idx;             /* stream tick index the transition covers */
+    uint8_t power;            /* raw 7-bit duty, 127 = full */
+    uint8_t fire;             /* FIRE bit state from idx onward */
+};
+
 static struct {
     bool active;              /* device I/O enabled (GFSINK set) */
     bool suspended;           /* device handed to another process */
     const char *dev;          /* pulse device path (GFSINK) */
     int fd;
+    int dump_fd;              /* GFSINK_DUMP: copy of the shipped stream */
     uint32_t rate;            /* machine tick = kernel step_freq */
     uint32_t depth;           /* preload/queue depth in bytes (ticks) */
 
@@ -107,6 +145,17 @@ static struct {
     double ship_t0;           /* wall time when shipping started */
     uint64_t clamped;         /* events pushed forward (late vs cursor) */
 
+    /* Laser transitions: produced on the tick grid, consumed by the
+     * shipper as it emits. cur_* is the state already written into the
+     * stream; power_sent guards the leading power byte per kernel run. */
+    struct laser_ev lev[LEV_N];
+    uint32_t lev_head;        /* consumer (shipper) */
+    uint32_t lev_tail;        /* producer */
+    uint8_t cur_power;
+    bool cur_fire;
+    bool power_sent;
+    bool lev_overflow_warned;
+
     /* Producer state: vticks/period written only under the core lock. */
     uint64_t vticks;          /* virtual step-clock time since wakeup epoch */
     double wall_epoch;        /* wall time of the wakeup epoch */
@@ -121,6 +170,7 @@ static struct {
     bool threads_started;
 } gf = {
     .fd = -1,
+    .dump_fd = -1,
     .period_latched = VTICKS_PER_BYTE,
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .wake_mx = PTHREAD_MUTEX_INITIALIZER,
@@ -130,6 +180,7 @@ static struct {
 static _Atomic bool armed = false;
 static _Atomic bool quit = false;
 static _Atomic bool fault_flag = false;
+static _Atomic bool laser_armed = false;
 
 static double wall_s (void)
 {
@@ -202,6 +253,56 @@ void gf_stream_pulse (uint8_t step_bits, uint8_t dir_bits)
     pthread_mutex_unlock(&gf.lock);
 }
 
+/* Producer/laser: map a power/fire transition at the current virtual
+ * time onto the pulse-byte grid. Idle-time calls are dropped: the core
+ * re-asserts spindle power at the first segment of every laser block
+ * (update_spindle_rpm is forced for laser blocks), and the kernel's
+ * end-of-data backstop keeps the physical lines low between streams -
+ * so nothing persists that the next stream does not restate. This also
+ * keeps non-laser motion (jogs, homing) fire-free by construction. */
+void gf_stream_laser (uint8_t power, bool fire)
+{
+    if(gf.failed)
+        return;
+
+    power &= 0x7f;
+
+    pthread_mutex_lock(&gf.lock);
+    if(gf.streaming) {
+        uint64_t idx = gf.base + gf.vticks / VTICKS_PER_BYTE;
+        if(idx < gf.shipped)
+            idx = gf.shipped;
+
+        uint32_t pending = gf.lev_tail - gf.lev_head;
+        if(pending > 0 && gf.lev[(gf.lev_tail - 1) & LEV_MASK].idx == idx) {
+            /* same machine tick: one transition per tick, last wins */
+            struct laser_ev *e = &gf.lev[(gf.lev_tail - 1) & LEV_MASK];
+            e->power = power;
+            e->fire = fire;
+        } else if(pending >= LEV_N) {
+            /* queue full: merge into the newest slot so the final state
+             * is exact (intermediate power steps are lost) */
+            struct laser_ev *e = &gf.lev[(gf.lev_tail - 1) & LEV_MASK];
+            e->power = power;
+            e->fire = fire;
+            if(!gf.lev_overflow_warned) {
+                gf.lev_overflow_warned = true;
+                fprintf(stderr, "gfstream: laser transition queue overflow (merging)\n");
+            }
+        } else {
+            gf.lev[gf.lev_tail & LEV_MASK] =
+                (struct laser_ev){ .idx = idx, .power = power, .fire = fire };
+            gf.lev_tail++;
+        }
+    }
+    pthread_mutex_unlock(&gf.lock);
+}
+
+void gf_stream_laser_arm (bool state)
+{
+    laser_armed = state;
+}
+
 void gf_stream_wakeup (void)
 {
     if(gf.failed)
@@ -220,9 +321,14 @@ void gf_stream_wakeup (void)
         if(!gf.kernel_running) {
             /* Fresh stream after a completed one: restart the stream-
              * relative index space (produced/shipped/due must share an
-             * origin) and preload one depth of pad slots. */
+             * origin) and preload one depth of pad slots. Laser
+             * transitions carry indices from the OLD space - stale ones
+             * would clog the queue head forever; the previous stream
+             * shipped out completely, so dropping them loses nothing. */
             gf.shipped = 0;
             gf.produced = gf.depth;
+            gf.lev_head = gf.lev_tail;
+            gf.cur_fire = false;
         } else {
             /* Continuation while the kernel still drains: the due/ship
              * cursor kept marching through the idle gap between cycles,
@@ -354,6 +460,8 @@ static void ship_pass (void)
             if(gf.active)
                 gfio_wr_attr("cnc/streaming", "0");
             gf.kernel_running = false;   /* kernel drains the queue and idles */
+            gf.power_sent = false;       /* the next run resets the duty */
+            gf.cur_fire = false;         /* end-of-data forces FIRE low */
             gf.hold_pending = true;
             gf.hold_poll_at = wall_s() + 0.1;
         }
@@ -389,15 +497,45 @@ static void ship_pass (void)
 
     while(gf.shipped < due && (streaming || gf.shipped < gf.produced)) {
         uint32_t n = 0;
-        while(n < SHIP_CHUNK && gf.shipped < due &&
+
+        /* Up to 2 bytes per tick (power byte + tick byte). */
+        while(n < SHIP_CHUNK - 1 && gf.shipped < due &&
                (streaming || gf.shipped < gf.produced)) {
+            /* Apply the laser transitions this tick reaches, coalesced
+             * to ONE power byte (the script drops back-to-back power
+             * bytes; the tick byte below always follows it). A power
+             * byte also MUST lead every kernel run (!power_sent): the
+             * run start resets the hardware duty to ~100%, and only a
+             * power byte ahead of the first fire bit closes that
+             * full-power window. Power bytes cost no machine tick, so
+             * insertions leave the due math untouched. */
+            bool due_ev = false;
+            uint8_t ev_power = gf.cur_power;
+            while(gf.lev_head != gf.lev_tail &&
+                   gf.lev[gf.lev_head & LEV_MASK].idx <= gf.shipped) {
+                struct laser_ev *e = &gf.lev[gf.lev_head & LEV_MASK];
+                ev_power = e->power;
+                gf.cur_fire = e->fire;
+                gf.lev_head++;
+                due_ev = true;
+            }
+            if((due_ev && ev_power != gf.cur_power) || !gf.power_sent) {
+                gf.cur_power = ev_power;
+                gf.power_sent = true;
+                chunk[n++] = 0x80 | gf.cur_power;
+            }
+
             uint32_t slot = gf.shipped & RING_MASK;
-            chunk[n++] = gf.ring[slot];
+            uint8_t b = gf.ring[slot];
             gf.ring[slot] = 0;           /* re-zero for the next lap */
+            if(gf.cur_fire)
+                b |= 0x10;
+            chunk[n++] = b;
             gf.shipped++;
         }
         if(n == 0)
             break;
+        if(gf.dump_fd >= 0 && write(gf.dump_fd, chunk, n) < 0) { /* debug copy only */ }
         if(gf.active && write(gf.fd, chunk, n) < 0) {
             fprintf(stderr, "gfstream: pulse write failed: %s\n", strerror(errno));
             gf.failed = true;
@@ -416,11 +554,20 @@ static void ship_pass (void)
         char state[16] = "";
         if(gfio_wr_attr("cnc/run", "1") != 0) {
             gfio_rd_attr("cnc/state", state, sizeof(state));
-            if(strcmp(state, "underrun") == 0) {
+            if(strcmp(state, "underrun") == 0 && !laser_armed) {
                 /* late detection of a starve: ack, then retry once */
                 fprintf(stderr, "gfstream: kernel underrun; recovering\n");
                 gfio_wr_attr("cnc/stop", "1");
                 gfio_wr_attr("cnc/run", "1");
+            } else if(strcmp(state, "underrun") == 0) {
+                /* Laser armed: a restarted run resets the hardware duty,
+                 * so replaying the queued bytes could fire remaining
+                 * fire bits at ~full power. Ack the underrun and fail
+                 * safe instead; the alarm path relocks the latch. */
+                fprintf(stderr, "gfstream: kernel underrun while laser armed - failing safe\n");
+                gfio_wr_attr("cnc/stop", "1");
+                gf.failed = true;
+                fault_flag = true;
             } else if(strcmp(state, "running") != 0) {
                 fprintf(stderr, "gfstream: run refused (state=%s)\n", state);
                 gf.failed = true;
@@ -459,6 +606,9 @@ void gf_stream_reset (void)
     pthread_mutex_lock(&gf.lock);
     gf.produced = gf.shipped;
     gf.streaming = false;
+    gf.lev_head = gf.lev_tail;   /* unshipped laser transitions die with the backlog */
+    gf.cur_fire = false;
+    gf.power_sent = false;
     if(gf.kernel_running) {
         if(gf.active) {
             gfio_wr_attr("cnc/stop", "1");
@@ -552,6 +702,10 @@ bool gf_stream_resume (void)
     gf.hold_pending = false;
     gf.failed = false;
     gf.suspended = false;
+    gf.lev_head = gf.lev_tail;
+    gf.cur_power = 0;
+    gf.cur_fire = false;
+    gf.power_sent = false;
     pthread_mutex_unlock(&gf.lock);
 
     if(!ok)
@@ -569,6 +723,11 @@ void gf_stream_init (void)
     uint32_t depth_ms = (opt = getenv("GFSINK_DEPTH_MS")) ? (uint32_t)atoi(opt) : 200;
     gf.depth = (uint32_t)((uint64_t)gf.rate * depth_ms / 1000);
 
+    /* Bench/debug: mirror every shipped byte to a file for offline
+     * stream inspection (works in null-sink mode too). */
+    if((opt = getenv("GFSINK_DUMP")) && *opt)
+        gf.dump_fd = open(opt, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
     if(dev != NULL && *dev != '\0') {
 
         gf.dev = dev;
@@ -577,9 +736,9 @@ void gf_stream_init (void)
             exit(1);
         }
 
-        /* Motion only: laser locked out at the driver, whatever else
-         * happens; then the full factory analog config (modes, decay,
-         * motor lock, hold currents). */
+        /* Laser latch locked at init (glowforge_laser.c unlocks it only
+         * inside an operator-armed job window); then the full factory
+         * analog config (modes, decay, motor lock, hold currents). */
         gfio_analog_config();
         snprintf(val, sizeof(val), "%u", gf.rate);
         if(gfio_wr_attr("cnc/step_freq", val) != 0) {
@@ -632,5 +791,9 @@ void gf_stream_shutdown (void)
     if(gf.fd >= 0) {
         close(gf.fd);
         gf.fd = -1;
+    }
+    if(gf.dump_fd >= 0) {
+        close(gf.dump_fd);
+        gf.dump_fd = -1;
     }
 }

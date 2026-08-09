@@ -48,6 +48,7 @@ add_executable(grblHAL_glowforge
     src/glowforge_io.c
     src/glowforge_cooling.c
     src/glowforge_homing.c
+    src/glowforge_laser.c
     src/serial.c
     src/eeprom.c
     src/grbl_eeprom_extensions.c

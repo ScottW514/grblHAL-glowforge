@@ -42,10 +42,16 @@
     auto-resumes once the temp is back under the resume gate. Senders
     see the Hold state and the [MSG:Warning:...] lines.
 
-  The laser milestone upgrades the flow fault and the temperature gates
-  from warnings/holds into hard fire interlocks; a flow suspicion will
-  then also take the safe posture (hold, laser off, forced cooling)
-  while its re-check decides.
+  LASER FIRE GATES (glowforge_laser.c consumes them): a flow FAULT or
+  an over-ceiling coolant temperature blocks arming and suppresses fire
+  mid-job (gfcool_fire_ok). While the laser is armed the run fan
+  profile is forced on - so flow interrogation covers every fire
+  window even if the sender never sends M8 - and a flow SUSPECT or
+  FAULT verdict takes the safe posture: feed hold + the run airflow
+  (laser off comes free - grblHAL laser mode drops the spindle in
+  hold, and the fire gate stands). A cleared suspicion auto-resumes;
+  a FAULT leaves the hold for the operator, and a manual resume in
+  that state runs motion with fire suppressed and loudly warned.
 
   Copyright (c) 2026 Scott Wiederhold <s.e.wiederhold@gmail.com>
   SPDX-License-Identifier: GPL-3.0-or-later
@@ -218,6 +224,10 @@ static double next_temp_check;
 static bool temp_warned = false;
 static bool hold_ours = false;
 static bool forced_cool = false;   /* we overrode the phase fans to cool */
+
+static bool laser_on_window = false;   /* laser armed (glowforge_laser.c) */
+static bool flow_hold = false;         /* we held the cycle for a flow verdict */
+static bool over_temp_gate = false;    /* fire gate with resume hysteresis */
 
 static double wall_s (void)
 {
@@ -400,11 +410,12 @@ void gfcool_init (void)
     next_temp_check = wall_s() + 5.0;
 }
 
-void gfcool_coolant_set (coolant_state_t state)
+/* The effective flood state is the sender's M8/M9 OR'd with the laser
+ * armed window: fire must never run without the cut airflow and the
+ * flow interrogation that only lives inside a flood session. */
+static void flood_apply (bool on)
 {
-    coolant_reported = state;
-
-    if(state.flood) {
+    if(on) {
         cool_conf_reload();             /* GUI changes apply per job */
         cool_state = Cool_Run;
         fans_run();
@@ -428,6 +439,49 @@ void gfcool_coolant_set (coolant_state_t state)
     }
 }
 
+void gfcool_coolant_set (coolant_state_t state)
+{
+    coolant_reported = state;
+    flood_apply(state.flood || laser_on_window);
+}
+
+void gfcool_laser_armed (bool armed)
+{
+    if(laser_on_window == armed)
+        return;
+    laser_on_window = armed;
+    flood_apply(coolant_reported.flood || armed);
+}
+
+bool gfcool_fire_ok (void)
+{
+    return flow_verdict != Flow_Fault && !over_temp_gate;
+}
+
+/* Safe posture on a flow SUSPECT/FAULT verdict inside an armed laser
+ * window: hold the cycle (laser mode drops the spindle in hold) with
+ * the run airflow already on. A cleared suspicion auto-resumes; a
+ * FAULT leaves the hold - and the fire gate - for the operator. */
+static void flow_safe_posture (void)
+{
+    if(laser_on_window && state_get() == STATE_CYCLE && !hold_ours && !flow_hold) {
+        flow_hold = true;
+        protocol_enqueue_realtime_command(CMD_FEED_HOLD);
+        warn("laser job held for the coolant flow verdict");
+    }
+}
+
+static void flow_posture_stand_down (void)
+{
+    if(flow_hold) {
+        flow_hold = false;
+        if((state_get() & STATE_HOLD) && !hold_ours) {
+            warn("coolant flow verdict clean - resuming");
+            protocol_enqueue_realtime_command(CMD_CYCLE_START);
+        }
+    }
+}
+
 coolant_state_t gfcool_coolant_get (void)
 {
     return coolant_reported;
@@ -441,12 +495,19 @@ void gfcool_poll (void)
         goto phases;
     next_temp_check = now + 1.0;
 
+    if(flow_hold && !(state_get() & STATE_HOLD))
+        flow_hold = false;      /* operator resumed or reset; their call */
+
     float down, up;
     bool have_down = read_temp("pic/water_temp_1", &down);
     bool have_up = read_temp("pic/water_temp_2", &up);
 
     if(have_up) {
         sys_state_t st = state_get();
+
+        /* Fire gate with hysteresis: gated over the run ceiling, back
+         * in service under the resume gate. */
+        over_temp_gate = up > (over_temp_gate ? temp_resume_c : temp_max_c);
 
         /* Over-temp while executing: factory-style pause. grblHAL will
          * not enter HOLD from a jog (state_machine.c refuses it - jogs
@@ -547,6 +608,7 @@ void gfcool_poll (void)
                              rise, flow_fault_rise, dt);
                 }
                 warn(msg);
+                flow_safe_posture();
             } else if(flow_verdict != Flow_Normal) {
                 snprintf(msg, sizeof(msg),
                          flow_verdict == Flow_Suspect
@@ -556,6 +618,7 @@ void gfcool_poll (void)
                 flow_verdict = Flow_Normal;
                 report_message(msg, Message_Info);
                 fprintf(stderr, "gfcool: %s\n", msg);
+                flow_posture_stand_down();
                 if(++flow_episodes == FLOW_TREND_N) {
                     snprintf(msg, sizeof(msg),
                              "%u coolant flow suspicions this job - check the pump and coolant level",
@@ -589,6 +652,7 @@ void gfcool_poll (void)
                  "COOLANT FLOW FAULT: no clean re-check within %u s - check the pump",
                  (unsigned)confirm_max_s);
         warn(msg);
+        flow_safe_posture();
     }
 
     /* Track downstream history for the stationarity test below. It is

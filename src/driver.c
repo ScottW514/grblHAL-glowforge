@@ -38,6 +38,7 @@
 #include "stepper_stream.h"
 #include "glowforge_cooling.h"
 #include "glowforge_homing.h"
+#include "glowforge_laser.h"
 #include "eeprom.h"
 #include "grbl_eeprom_extensions.h"
 
@@ -231,55 +232,6 @@ static void irqEnable (void)
 
 /* ------------------------------------------------------------------------- */
 
-/* --- locked laser spindle -------------------------------------------------
- * Senders (LightBurn et al) drive lasers with M3/M4 + S words and expect
- * $32 laser mode; grblHAL rejects M4 and won't latch $32 unless a
- * laser-capable spindle is registered. This spindle advertises the
- * capabilities and swallows everything: power values go nowhere, the
- * pulse stream never carries the laser bit, and the kernel laser latch
- * stays locked. It becomes the real laser mapping in a later, scope-gated
- * milestone. */
-
-static spindle_state_t spindle_state = {0};
-
-static bool spindleConfig (spindle_ptrs_t *spindle)
-{
-    /* The core dereferences context.pwm->settings for any PWM-type
-     * spindle (spindle_activate); precompute wires that context up even
-     * though our power handlers discard everything. */
-    static spindle_pwm_t spindle_pwm;
-
-    if(spindle == NULL)
-        return false;
-
-    spindle_precompute_pwm_values(spindle, &spindle_pwm, &settings.pwm_spindle, 1000000);
-
-    return true;
-}
-
-static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, float rpm)
-{
-    (void)spindle; (void)rpm;
-    spindle_state = state;
-}
-
-static spindle_state_t spindleGetState (spindle_ptrs_t *spindle)
-{
-    (void)spindle;
-    return spindle_state;
-}
-
-static uint_fast16_t spindleGetPWM (spindle_ptrs_t *spindle, float rpm)
-{
-    (void)spindle; (void)rpm;
-    return 0;
-}
-
-static void spindleUpdatePWM (spindle_ptrs_t *spindle, uint_fast16_t pwm)
-{
-    (void)spindle; (void)pwm;
-}
-
 void settings_changed (settings_t *settings, settings_changed_flags_t changed)
 {
     (void)settings; (void)changed;
@@ -289,9 +241,13 @@ void settings_changed (settings_t *settings, settings_changed_flags_t changed)
 static void driverReset (void)
 {
     /* Called for both EXEC_STOP and EXEC_RESET; only a real reset may kill
-     * the stream (EXEC_STOP's controlled decel must play out normally). */
-    if(sys.reset_pending)
+     * the stream (EXEC_STOP's controlled decel must play out normally).
+     * The latch relock comes first: FIRE is severed before the stream
+     * teardown even begins. */
+    if(sys.reset_pending) {
+        gflaser_disarm();
         gf_stream_reset();
+    }
 
     driver_reset_chain();
 }
@@ -310,11 +266,13 @@ static void glowforge_process_realtime (uint_fast16_t state)
 
     if(gf_stream_fault_take()) {
         fprintf(stderr, "gfstream: stream fault - raising alarm, re-home required\n");
+        gflaser_disarm();
         gfhome_invalidate();
         system_raise_alarm(Alarm_MotorFault);
     }
 
     gfcool_poll();
+    gflaser_poll();
 
     if(exit_requested && state != STATE_CYCLE && state != STATE_JOG && state != STATE_HOMING)
         exit(EXIT_SUCCESS);
@@ -349,9 +307,10 @@ bool driver_init (void)
     gf_stream_init();
     gfcool_init();
     gfhome_init();
+    gflaser_init();
 
     hal.info = "Glowforge";
-    hal.driver_version = "260807";
+    hal.driver_version = "260809";
     hal.driver_url = "https://github.com/ScottW514/grblHAL-glowforge";
     hal.board = "Glowforge factory control board (i.MX6)";
     hal.driver_setup = driver_setup;
@@ -380,20 +339,6 @@ bool driver_init (void)
     hal.coolant.get_state = coolantGetState;
 
     hal.control.get_state = systemGetState;
-
-    static const spindle_ptrs_t spindle = {
-        .type = SpindleType_PWM,
-        .cap.variable = On,
-        .cap.laser = On,
-        .cap.direction = On,
-        .config = spindleConfig,
-        .get_pwm = spindleGetPWM,
-        .update_pwm = spindleUpdatePWM,
-        .set_state = spindleSetState,
-        .get_state = spindleGetState
-    };
-
-    spindle_register(&spindle, "Glowforge laser (locked)");
 
     memcpy(&hal.stream, serialInit(), sizeof(io_stream_t));
 

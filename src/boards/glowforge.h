@@ -43,9 +43,9 @@
 #define DEFAULT_Z_MAX_TRAVEL 10.6f
 
 // It is a laser: $32 on by default so senders' M3/M4 dynamic-power
-// semantics work without a settings dance. Fire remains impossible at
-// this stage (locked spindle + hardware laser latch + no laser bit in
-// the pulse stream).
+// semantics work without a settings dance. Fire additionally requires
+// the operator-armed window (glowforge_laser.c: button press unlocks
+// the kernel laser latch) and the hardware safety chain.
 #define DEFAULT_LASER_MODE On
 
 // The machine has no limit or home switches; the operator selects the

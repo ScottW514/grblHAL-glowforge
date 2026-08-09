@@ -27,6 +27,19 @@ void gf_stream_go_idle (void);
 void gf_stream_cycles_per_tick (uint32_t cycles);
 void gf_stream_pulse (uint8_t step_bits, uint8_t dir_bits); // grblHAL bit order
 
+// Laser power/fire transition at the current virtual time (call with the
+// core lock held). power is the raw 7-bit PWM duty (127 = full); fire
+// drives the per-tick FIRE bit from this stream position onward. Dropped
+// while the stream is idle: every laser block re-asserts power at its
+// first segment, and the end-of-data backstop keeps the lines low.
+void gf_stream_laser (uint8_t power, bool fire);
+
+// Laser arming state (glowforge_laser.c owns the policy). While armed an
+// underrun faults the stream instead of the stop/run retry: a restarted
+// run resets the hardware PWM duty, so replaying queued fire bits would
+// fire at ~full power.
+void gf_stream_laser_arm (bool armed);
+
 // hal.driver_reset hook body: abort the stream (drop unshipped backlog,
 // kernel controlled stop). Call only when sys.reset_pending.
 void gf_stream_reset (void);

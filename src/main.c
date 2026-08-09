@@ -56,6 +56,7 @@ static void print_usage (const char *badarg)
       "    GFSINK           : pulse device (/dev/glowforge). Unset = null-sink mode.\n"
       "    GFSINK_RATE      : machine tick Hz (default 28160, the factory travel tick).\n"
       "    GFSINK_DEPTH_MS  : stream queue depth = feed-hold latency (default 200).\n"
+      "    GFSINK_DUMP      : mirror the shipped pulse stream to this file (debug).\n"
       "    GFHOME_CONF      : homing config file (default /data/forgefirm.conf).\n"
       "\n"
       "  ^F (or SIGINT/SIGTERM) shuts down cleanly once motion is done.\n"
