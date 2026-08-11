@@ -665,6 +665,26 @@ bool gf_stream_suspend (void)
     return idle;
 }
 
+/* The 40 V motor rail tolerates a clean power-up but not a fast off/on
+ * bounce: re-enabling within ~tens of ms of the previous drop can leave
+ * the supply folded back, where the SDMA stream plays and counts
+ * normally while the motors produce no torque or stall mid-move. Every
+ * takeover of the pulse device therefore starts with a deliberate off
+ * period so the rail always powers up from a settled state.
+ * Conf key: rail_settle_s (seconds, 0 disables). */
+#define RAIL_SETTLE_S_DEFAULT 2.5f
+
+static void rail_settle (void)
+{
+    float s = gfio_conf_read_float("rail_settle_s", RAIL_SETTLE_S_DEFAULT);
+    if(s <= 0.0f)
+        return;
+    gfio_wr_attr("cnc/disable", "1");
+    fprintf(stderr, "gfstream: settling motor rail for %.1f s\n", s);
+    for(double end = wall_s() + (double)s; wall_s() < end; )
+        sleep_ns(50000000);
+}
+
 bool gf_stream_resume (void)
 {
     if(!gf.active)
@@ -685,6 +705,10 @@ bool gf_stream_resume (void)
 
     pthread_mutex_lock(&gf.lock);
     gf.fd = fd;
+
+    /* The exiting session dropped the 40 V rail moments ago and our open
+     * bounced it back on; give the supply a real off period first. */
+    rail_settle();
 
     /* The homing session reconfigured the machine; re-apply the full
      * analog config and stream state exactly as at init. */
@@ -735,6 +759,10 @@ void gf_stream_init (void)
             fprintf(stderr, "gfstream: cannot open %s\n", dev);
             exit(1);
         }
+
+        /* The open just powered the 40 V rail, possibly moments after the
+         * previous holder dropped it; settle it before configuring. */
+        rail_settle();
 
         /* Laser latch locked at init (glowforge_laser.c unlocks it only
          * inside an operator-armed job window); then the full factory
