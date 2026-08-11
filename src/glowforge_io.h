@@ -7,6 +7,7 @@
 */
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 
 // Attribute paths are relative to /sys/glowforge/ (e.g. "cnc/state",
@@ -16,9 +17,16 @@ int gfio_rd_attr (const char *attr, char *buf, size_t len);
 
 // Open the pulse device and take the exclusive flock (the kernel dead
 // man's switch). Returns the fd, or -1. The _nb variant fails instead
-// of blocking when another process still holds the lock.
+// of blocking when another process still holds the lock. Under the
+// forgectrl device broker (GF_PULSE_FD in the environment) both return
+// the inherited fd instead of opening - see glowforge_io.c.
 int gfio_open_pulse_dev (const char *path);
 int gfio_open_pulse_dev_nb (const char *path);
+
+// True when the pulse device came in from the broker: the device stays
+// open across handovers (never close it; the rail never cycled, so no
+// settle is needed on takeover).
+bool gfio_pulse_inherited (void);
 
 // Factory analog machine config (print-header ground truth): x8 XY
 // microstepping, slow-decay mode, Z locked in the pulse stream, laser

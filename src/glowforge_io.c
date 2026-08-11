@@ -9,6 +9,7 @@
 
 #include <ctype.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,13 +73,47 @@ static int open_pulse_dev (const char *path, int lock_flags)
     return fd;
 }
 
+/* Broker mode: the forgectrl supervisor holds /dev/glowforge open for
+ * its lifetime (the device is exclusive-open) and hands the writer a
+ * dup at spawn, named by GF_PULSE_FD. The flock rides the shared open
+ * file description - the relock below is a no-op on it - and closing
+ * this fd is never the final close while the supervisor lives, so
+ * handovers stop cycling the 40 V rail. The supervisor is the
+ * dead-man for its writers; the kernel dead-man still backstops the
+ * whole description. */
+static int inherited_pulse_fd (void)
+{
+    const char *v = getenv("GF_PULSE_FD");
+    if(v == NULL || *v == '\0')
+        return -1;
+    int fd = atoi(v);
+    if(fd < 0 || fcntl(fd, F_GETFL) < 0)
+        return -1;
+    return fd;
+}
+
+bool gfio_pulse_inherited (void)
+{
+    return inherited_pulse_fd() >= 0;
+}
+
 int gfio_open_pulse_dev (const char *path)
 {
+    int fd = inherited_pulse_fd();
+    if(fd >= 0) {
+        flock(fd, LOCK_EX);
+        return fd;
+    }
     return open_pulse_dev(path, LOCK_EX);
 }
 
 int gfio_open_pulse_dev_nb (const char *path)
 {
+    int fd = inherited_pulse_fd();
+    if(fd >= 0) {
+        flock(fd, LOCK_EX);
+        return fd;
+    }
     return open_pulse_dev(path, LOCK_EX | LOCK_NB);
 }
 

@@ -657,8 +657,14 @@ bool gf_stream_suspend (void)
             gf.hold_pending = false;
         }
         gf.suspended = true;
-        close(gf.fd);
-        gf.fd = -1;
+        /* Under the broker the device stays open across the handover
+         * (the homing runner inherits the same description through its
+         * environment); the producer is gated by the suspended flag.
+         * Standalone, the close is the handover. */
+        if(!gfio_pulse_inherited()) {
+            close(gf.fd);
+            gf.fd = -1;
+        }
     }
     pthread_mutex_unlock(&gf.lock);
 
@@ -690,25 +696,35 @@ bool gf_stream_resume (void)
     if(!gf.active)
         return true;
 
-    /* The previous owner has exited but its fd close can lag; take the
-     * lock non-blocking with a short retry so the protocol thread never
-     * hangs here. */
-    int fd = -1;
-    for(int tries = 0; fd < 0 && tries < 50; tries++) {
-        if((fd = gfio_open_pulse_dev_nb(gf.dev)) < 0)
-            sleep_ns(100000000);   /* 100 ms */
-    }
-    if(fd < 0) {
-        fprintf(stderr, "gfstream: cannot reacquire %s\n", gf.dev);
-        return false;
+    int fd;
+    if(gfio_pulse_inherited()) {
+        /* Broker: we kept the fd across the handover and the device
+         * never closed - the rail never dropped, so there is nothing
+         * to settle. */
+        fd = gf.fd;
+    } else {
+        /* The previous owner has exited but its fd close can lag; take
+         * the lock non-blocking with a short retry so the protocol
+         * thread never hangs here. */
+        fd = -1;
+        for(int tries = 0; fd < 0 && tries < 50; tries++) {
+            if((fd = gfio_open_pulse_dev_nb(gf.dev)) < 0)
+                sleep_ns(100000000);   /* 100 ms */
+        }
+        if(fd < 0) {
+            fprintf(stderr, "gfstream: cannot reacquire %s\n", gf.dev);
+            return false;
+        }
     }
 
     pthread_mutex_lock(&gf.lock);
     gf.fd = fd;
 
-    /* The exiting session dropped the 40 V rail moments ago and our open
-     * bounced it back on; give the supply a real off period first. */
-    rail_settle();
+    /* Standalone, the exiting session dropped the 40 V rail moments ago
+     * and our open bounced it back on; give the supply a real off
+     * period first. */
+    if(!gfio_pulse_inherited())
+        rail_settle();
 
     /* The homing session reconfigured the machine; re-apply the full
      * analog config and stream state exactly as at init. */
@@ -760,9 +776,14 @@ void gf_stream_init (void)
             exit(1);
         }
 
-        /* The open just powered the 40 V rail, possibly moments after the
-         * previous holder dropped it; settle it before configuring. */
-        rail_settle();
+        /* Standalone, this open may have re-powered the 40 V rail
+         * moments after the previous holder dropped it; settle it
+         * before configuring. Under the broker the device (and the
+         * rail's state) is continuous across our restarts. */
+        if(!gfio_pulse_inherited())
+            rail_settle();
+        else
+            fprintf(stderr, "gfstream: pulse device inherited from the broker\n");
 
         /* Laser latch locked at init (glowforge_laser.c unlocks it only
          * inside an operator-armed job window); then the full factory
