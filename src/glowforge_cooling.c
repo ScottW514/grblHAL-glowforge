@@ -314,6 +314,11 @@ void gfcool_poll (void)
                 if(!stale_warned) {
                     stale_warned = true;
                     warn("cooling service lost - fire blocked, holding");
+                    /* The engine only runs the check heater inside this
+                     * window; if it died mid-check the heater is still
+                     * on, and like the fallback fans this is a write
+                     * nobody else will make now. */
+                    gfio_wr_attr("thermal/heater_pwm", "0");
                 }
                 if(st == STATE_CYCLE && !hold_ours) {
                     hold_ours = true;
