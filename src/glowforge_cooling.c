@@ -1,67 +1,52 @@
 /*
-  glowforge_cooling.c - fan / coolant management for the Glowforge board
+  glowforge_cooling.c - cooling-service client for the Glowforge board
 
-  Part of grblHAL-glowforge. Job-state fan and coolant policy built from
-  the factory's own numbers (captured pulse-file headers + settings map):
-  fan duties AAid=204/AArd=1023, EFrd=65535, IFrd=43278; coolant windows
-  CM* in millidegrees - run ceiling 33 C (CMrx), start/resume gate 31 C
-  (CMwx), idle max 50 C. All thresholds user-tunable: cool_* keys in
-  the shared machine config (forgectrl Machine tab, re-read per flood
-  start), GFCOOL_* env vars as bench overrides that win for the
-  process lifetime.
+  Part of grblHAL-glowforge. The cooling engine - fan/pump/TEC/heater
+  profiles, coolant-flow verification, over-temp policy - lives in
+  forgectrl (the machine-services daemon); the shared contract is
+  forgectrl docs/SERVICES.md. This client:
 
-  Policy:
-  - IDLE: pump on, TEC off, purge on, fans at factory idle, HEATER OFF
-    (an always-on flow heater measurably warms the loop - ~1.5 C in
-    minutes on this machine - eating headroom below the 31 C start gate
-    for no benefit while nothing can fire).
-  - RUN (M8, LightBurn's per-layer air assist): cut-profile fans, plus
-    periodic coolant-flow verification. The flow heater sits between
-    the two water-temp sensors; each check runs it at FLOW_HEATER_PCT
-    for FLOW_CHECK_S and reads how far the downstream sensor climbs
-    (flowing coolant carries the heat away; a stagnant loop cooks the
-    downstream sensor). Checks repeat every FLOW_RECHECK_S and start
-    only from a thermally settled loop; the constants below carry the
-    measured rationale. An over-limit reading is a SUSPICION, not a
-    fault: it warns and requests an immediate re-check, and only a
-    second consecutive over-limit (no clean check in between,
-    whatever the wall-clock gap) - or a suspicion the loop cannot
-    resolve within FLOW_CONFIRM_MAX_S - raises COOLANT FLOW FAULT.
-    A clean re-check clears the suspicion: transient events (a pump
-    airlock burp, disturbed coolant) self-clear within minutes, while
-    true stagnation cannot pass a settled re-check. Cleared
-    suspicions still count - FLOW_TREND_N of them in one job earn an
-    aggregated check-your-coolant warning.
-  - COOLDOWN (M9): 15 s smoke-clear at run duty, then a thermal phase at
-    reduced duty (fan airflow measurably cools the loop) until the
-    upstream temp is back under the resume gate or a timeout expires;
-    heater off for the whole cooldown (it would fight the cooling).
-  - OVER-TEMP HOLD: if the upstream temp exceeds the run ceiling while a
-    cycle/jog is executing, the driver issues a real feed hold (the
-    factory pauses jobs the same way), forces cooling airflow, and
-    auto-resumes once the temp is back under the resume gate. Senders
-    see the Hold state and the [MSG:Warning:...] lines.
+  - reports job state to the engine: POST /cool/state (127.0.0.1,
+    FORGECTRL_PORT or 8080) with mode=idle|run|cooldown and the armed
+    flag - level-triggered, re-sent every ~1 s from gfcool_poll and
+    immediately on every change, so a lost report self-heals. The
+    effective run window is the sender's M8/M9 OR'd with the laser
+    armed window: fire must never run without the cut airflow and the
+    flow interrogation that only lives inside a run session.
 
-  LASER FIRE GATES (glowforge_laser.c consumes them): a flow FAULT or
-  an over-ceiling coolant temperature blocks arming and suppresses fire
-  mid-job (gfcool_fire_ok). While the laser is armed the run fan
-  profile is forced on - so flow interrogation covers every fire
-  window even if the sender never sends M8 - and a flow SUSPECT or
-  FAULT verdict takes the safe posture: feed hold + the run airflow
-  (laser off comes free - grblHAL laser mode drops the spindle in
-  hold, and the fire gate stands). A cleared suspicion auto-resumes;
-  a FAULT leaves the hold for the operator, and a manual resume in
-  that state runs motion with fire suppressed and loudly warned.
+  - reads the engine's verdict from /run/forgefirm/cooling.state and
+    enforces it in-process: gfcool_fire_ok() gates the laser (the
+    stepper producer thread reads a cached flag with a monotonic
+    freshness deadline - no file IO on that path), a hold verdict
+    takes a real feed hold (jogs are canceled instead - grblHAL never
+    holds a jog), and resume_ok auto-resumes a hold this client took.
+    A missing or stale verdict (ts_mono older than 2 s) is treated as
+    fire_ok=false, hold=true: the engine being gone must look exactly
+    like a fault.
+
+  - EMERGENCY FALLBACK: if the verdict goes stale while the laser is
+    armed, the engine is provably absent and nobody else will move the
+    fans - so this client writes the factory run duties directly to
+    sysfs once, holds, and stands down. This is the one sanctioned
+    exception to the engine's single-writer ownership; the duties are
+    compiled in (no config dependency - the same failure may take the
+    config file).
+
+  The hardware AND-gate (OK_2_FIRE) remains the safety boundary;
+  everything here is equipment protection and defense in depth.
 
   Copyright (c) 2026 Scott Wiederhold <s.e.wiederhold@gmail.com>
   SPDX-License-Identifier: GPL-3.0-or-later
 */
 
-#include <math.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "glowforge_cooling.h"
 #include "glowforge_io.h"
@@ -72,267 +57,51 @@
 #include "grbl/report.h"
 #include "grbl/state_machine.h"
 
-/* Factory fan values (pulse-header ground truth). */
-#define AIR_ASSIST_IDLE "204"
-#define AIR_ASSIST_RUN  "1023"
-#define EXHAUST_IDLE    "0"
-#define EXHAUST_RUN     "65535"
-#define INTAKE_IDLE     "0"
-#define INTAKE_RUN      "43278"
-/* Thermal-cooldown duty: half the run airflow - enough to keep pulling
- * heat out of the loop without the full-run roar. */
-#define EXHAUST_COOL    "32768"
-#define INTAKE_COOL     "21639"
+#define VERDICT_FILE   "/run/forgefirm/cooling.state"
+/* Reader staleness window per the contract: a verdict older than this
+ * is no verdict. The engine publishes at 1 Hz. */
+#define VERDICT_MAX_AGE_MS 2000
+/* Report cadence (level-triggered refresh). */
+#define REPORT_PERIOD_MS   1000
+/* Socket timeouts for the report POST: localhost, so anything slower
+ * than this means forgectrl is wedged - drop the report and move on
+ * (the level-triggered refresh retries in a second). */
+#define REPORT_TIMEOUT_MS  250
 
-/* Defaults, all env-adjustable (see gfcool_init). Temperature values are
- * the factory coolant-monitor windows (job-header CM*, millidegrees):
- * run ceiling CMrx=33 C, start/resume gate CMwx=31 C. */
-#define COOLDOWN_SMOKE_S       15
-#define COOLDOWN_MAX_S         300
-#define TEMP_MAX_C_DEFAULT     33.0f
-#define TEMP_RESUME_C_DEFAULT  31.0f
+/* Factory run fan duties for the emergency fallback (pulse-header
+ * ground truth, mirrored in the contract doc). */
+#define FB_AIR_ASSIST "1023"
+#define FB_EXHAUST    "65535"
+#define FB_INTAKE     "43278"
 
-/* Flow check. Characterized on the machine with the factory temperature
- * curve (scripts/bench/flow_characterize.py):
- *   heater 10% -> flow dT <= +3.69, no-flow dT >= +3.74  (0.04 C gap:
- *                 UNUSABLE, sensor noise alone spans ~0.9 C)
- *   heater 30% -> flow dT <= +9.32, no-flow dT >= +10.99 (1.67 C gap)
- * So the check runs at 30% and only briefly: the delta plateaus by
- * ~30 s, and continuous 30% heating would add ~0.7 C/min to the loop.
- * After the check the heater goes off and absolute-temperature
- * monitoring carries the protection (a pump failure mid-cut shows up
- * far faster as a temperature climb than as a heater delta). */
-/* Duty matters more than anything else here. Below ~40% the stagnant
- * loop sheds the heater's output by natural convection well enough to
- * MIMIC FLOW: at 30%/50 s the five no-flow trials read 8.15, 8.69,
- * 8.78, 12.25, 13.33 C while flow never exceeded 9.08 - three of five
- * dead-pump cases look healthier than a working pump. At 40% the heat
- * input outruns convection and the signature becomes decisive and
- * repeatable (see the design matrix, scripts/bench/flow_matrix.py). */
-#define FLOW_HEATER_PCT    40
-#define FLOW_CHECK_S       50      /* 0 disables the check entirely */
-#define FLOW_ESTABLISH_S   30      /* delta plateaus by here (reporting only) */
-/* Re-check cadence while a job runs. A stopped pump CANNOT be seen any
- * other way: absolute temperature only tracks a circulating loop, and a
- * light engrave may add so little heat that a flat trend proves
- * nothing. Detection latency is this interval plus the check length. */
-#define FLOW_RECHECK_S     150
-
-/* A check is only meaningful from a thermally SETTLED loop. If the
- * downstream sensor is still falling from earlier heating, the baseline
- * is captured mid-transient and the measured rise is garbage -
- * bench-proven to misclassify in BOTH directions, including reporting
- * flow when the pump was stopped (a MISS).
- *
- * Sensor agreement alone is NOT sufficient: both sensors can be
- * plunging together and cross within any tolerance while the loop is
- * still far from steady - that exact case produced a miss on the bench
- * (rise 11.2 with the pump stopped, from a loop cooling out of 48 C).
- * So the gate also requires the downstream reading to be STATIONARY
- * over a window before the baseline is taken.
- *
- * Stationarity is measured as the difference between the mean of the
- * newer half of the window and the mean of the older half. Peak-to-peak
- * does not work: measured on a settled loop this sensor shows 0.52 C of
- * p-p jitter over 15 s (0.70 worst), so any p-p threshold tight enough
- * to catch drift sits below the noise floor and the gate never opens.
- * Averaging each
- * half cuts that to 0.11 C typical / 0.21 C worst, while a real cooling
- * transient (~2 C per 15 s) still shows ~1.5 C. */
-#define FLOW_SETTLE_DT_C    1.5f    /* |downstream - upstream| */
-#define FLOW_SETTLE_DRIFT_C 0.4f    /* split-half mean difference */
-#define FLOW_SETTLE_WIN     15      /* 1 Hz samples */
-#define FLOW_SETTLE_WARN_S  180
-
-/* The DISCRIMINATOR is how far the downstream sensor climbs during the
- * check, not the upstream/downstream delta. Measured from cold at 30%
- * heater: with flow the downstream plateaus at about +10.5 C, without
- * flow it passes +16 C and is still climbing - a ~6 C margin, versus
- * only ~2 C for the delta. The delta is NOT a usable discriminator: a
- * check that starts from a cold heater never reaches the steady-state
- * delta (bench: a live pump-off drill reads 8.8 C against a 10.2 C
- * limit - a false negative). */
-/* Balanced midpoint of the pooled bracket at 40%/50 s: across 17 flow
- * observations (design matrix, repeat validations, and a 40-minute
- * sustained run) the largest healthy rise was 12.75 C, and across 8
- * pump-stopped observations the smallest was 16.04 C. 14.4 sits ~1.6 C
- * from either edge. All baselines were 19-23 C; the warm-loop end of
- * the range is NOT yet validated (a first-light commissioning item).
- * GFCOOL_FLOW_RISE overrides. */
-#define FLOW_FAULT_RISE_C  14.4f
-
-/* A suspicion must resolve. With flow, the check's own heat sheds in
- * under a minute and the confirming verdict lands 2-4 min after the
- * suspect one; with a truly dead pump the cooked region needs ~3-5 min
- * of conduction-only decay before the settle gate reopens, and the
- * re-check then reads stagnant again. A loop that cannot produce any
- * verdict inside this budget has shown no evidence of health and is
- * treated as faulted. The budget restarts with each flood session -
- * checks cannot run outside one. GFCOOL_CONFIRM_MAX_S overrides. */
-#define FLOW_CONFIRM_MAX_S 480
-/* Cleared suspicions per job that earn an aggregated warning: each one
- * was disproven by its re-check, but several in a single job point at
- * a marginal pump or recurring airlock. */
-#define FLOW_TREND_N       3
-
-typedef enum {
-    Cool_Idle = 0,
-    Cool_Run,
-    Cool_Smoke,      /* post-job smoke clear at run duty */
-    Cool_Thermal,    /* reduced-duty airflow until temp recovers */
-} cool_state_t;
-
-static cool_state_t cool_state = Cool_Idle;
 static coolant_state_t coolant_reported = {0};
-static uint32_t smoke_s = COOLDOWN_SMOKE_S;
-static uint32_t cooldown_max_s = COOLDOWN_MAX_S;
-static float temp_max_c = TEMP_MAX_C_DEFAULT;
-static float temp_resume_c = TEMP_RESUME_C_DEFAULT;
-static float flow_fault_rise = FLOW_FAULT_RISE_C;
-static uint32_t flow_heater_pct = FLOW_HEATER_PCT;
-static uint32_t flow_check_s = FLOW_CHECK_S;
-static uint32_t flow_recheck_s = FLOW_RECHECK_S;
-static double flow_next_check;
-static bool flow_check_active = false;
-static bool flow_check_pending = false;
-static double flow_pending_since;
-static bool flow_settle_warned = false;
-static bool flow_base_set = false;
-static float down_hist[FLOW_SETTLE_WIN];
-static uint32_t down_hist_n = 0;
-static float flow_base_down;
-static double flow_establish_at, flow_check_end;
-static float flow_dt_sum;
-static uint32_t flow_dt_n;
+static bool laser_on_window = false;    /* armed (glowforge_laser.c) */
+static bool was_run = false;            /* for the cooldown report */
 
-/* One over-limit reading opens a suspicion; the next completed check
- * decides it, whenever that is - "consecutive" means no clean check in
- * between, not close in time. */
-typedef enum {
-    Flow_Normal = 0,
-    Flow_Suspect,       /* one over-limit; the re-check decides */
-    Flow_Fault,         /* consecutive over-limits, or a starved re-check */
-} flow_verdict_t;
+/* Verdict cache. fire_ok is read from the stepper producer thread:
+ * 32-bit aligned reads are atomic on this platform, and the deadline
+ * comparison makes a stalled poll thread read as fire-blocked. */
+static volatile bool v_fire_ok = false;
+static volatile bool v_hold = false;
+static volatile bool v_resume_ok = false;
+static volatile uint32_t v_fresh_until_ms = 0;
+static char v_reason[112];
+static char v_reason_shown[112];
 
-static flow_verdict_t flow_verdict = Flow_Normal;
-static double flow_suspect_since;
-static uint32_t confirm_max_s = FLOW_CONFIRM_MAX_S;
-static uint32_t flow_episodes = 0;  /* cleared suspicions this job */
-
-static double phase_until;         /* smoke end / thermal timeout */
-static double next_temp_check;
-static bool temp_warned = false;
 static bool hold_ours = false;
-static bool forced_cool = false;   /* we overrode the phase fans to cool */
+static bool jog_warned = false;
+static bool fallback_done = false;
+static bool stale_warned = false;
 
-static bool laser_on_window = false;   /* laser armed (glowforge_laser.c) */
-static bool flow_hold = false;         /* we held the cycle for a flow verdict */
-static bool over_temp_gate = false;    /* fire gate with resume hysteresis */
+static uint32_t next_report_ms = 0;
+static uint32_t next_verdict_ms = 0;
+static int http_port = 8080;
 
-static double wall_s (void)
+static uint32_t mono_ms (void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
-}
-
-static void fans_idle (void)
-{
-    gfio_wr_attr("head/air_assist_pwm", AIR_ASSIST_IDLE);
-    gfio_wr_attr("thermal/exhaust_pwm", EXHAUST_IDLE);
-    gfio_wr_attr("thermal/intake_pwm", INTAKE_IDLE);
-}
-
-static void fans_run (void)
-{
-    gfio_wr_attr("head/air_assist_pwm", AIR_ASSIST_RUN);
-    gfio_wr_attr("thermal/exhaust_pwm", EXHAUST_RUN);
-    gfio_wr_attr("thermal/intake_pwm", INTAKE_RUN);
-}
-
-static void fans_cool (void)
-{
-    gfio_wr_attr("head/air_assist_pwm", AIR_ASSIST_IDLE);
-    gfio_wr_attr("thermal/exhaust_pwm", EXHAUST_COOL);
-    gfio_wr_attr("thermal/intake_pwm", INTAKE_COOL);
-}
-
-/* Reapply the fan profile the current phase calls for (used when an
- * over-temp intervention forced cooling airflow and then stood down). */
-static void fans_apply_phase (void)
-{
-    switch(cool_state) {
-        case Cool_Run:
-        case Cool_Smoke:
-            fans_run();
-            break;
-        case Cool_Thermal:
-            fans_cool();
-            break;
-        default:
-            fans_idle();
-            break;
-    }
-}
-
-static void heater_set_pct (uint32_t pct)
-{
-    char val[16];
-    snprintf(val, sizeof(val), "%u", pct * 65535 / 100);
-    gfio_wr_attr("thermal/heater_pwm", val);
-}
-
-/* Begin a flow check: heater up, baseline captured on the next poll,
- * verdict at the end of the window, heater back off. */
-static void flow_check_start (double now)
-{
-    flow_check_active = true;
-    flow_base_set = false;
-    flow_establish_at = now + FLOW_ESTABLISH_S;
-    flow_check_end = now + (double)flow_check_s;
-    flow_dt_sum = 0.0f;
-    flow_dt_n = 0;
-    heater_set_pct(flow_heater_pct);
-}
-
-/* Raw ADC -> degrees C for the two coolant thermistors.
- *
- * This is the FACTORY conversion, recovered from the v2.6.0 firmware
- * binary (forward function at 0x65110, inverse at 0x64ee8, parameter
- * block in .data at VMA 0x11e120): a single-parameter B-equation NTC
- * behind a divider and gain stage, i.e.
- *
- *   R     = Rd / (F/raw - 1),  F = adc_steps * gain
- *   T[K]  = beta / ln(R / Rinf),  Rinf = R0 * exp(-beta/T0)
- *
- * with R0 = 10k at T0 = 298.15 K, beta = 3380, Rd = 10k, gain = 1.3,
- * adc_steps = 1024. Proof it is the right one: running the firmware's
- * inverse on the cloud's coolant setpoints reproduces this machine's
- * WT* settings exactly (CMet 18134 mDeg -> raw 754 = WTub; CMdt 18364
- * -> raw 751 = WTvb); measured against a thermometer at equilibrium
- * the curve lands within ~1 C. */
-static float thermistor_c (int raw)
-{
-    static const double adc_f = 1024.0 * 1.3;   /* 1331.2 */
-    static const double rd = 10000.0;
-    static const double beta = 3380.0;
-    double rinf = 10000.0 * exp(-3380.0 / 298.15);
-
-    if(raw <= 0 || (double)raw >= adc_f)
-        return -273.15f;                        /* open / shorted */
-
-    double r = rd / (adc_f / (double)raw - 1.0);
-
-    return (float)(beta / log(r / rinf) - 273.15);
-}
-
-static bool read_temp (const char *attr, float *c)
-{
-    char buf[16];
-    if(gfio_rd_attr(attr, buf, sizeof(buf)) != 0)
-        return false;
-    *c = thermistor_c(atoi(buf));
-    return true;
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u);
 }
 
 static void warn (const char *msg)
@@ -341,144 +110,166 @@ static void warn (const char *msg)
     fprintf(stderr, "gfcool: %s\n", msg);
 }
 
-/* Tunables resolve env > conf > compiled default. The GFCOOL_* env
- * vars are the bench-debug path and win for the process lifetime; the
- * cool_* keys in the shared machine config are the user-facing store
- * (forgectrl Machine tab) and are re-read at every flood start, so GUI
- * changes apply from the next job with no restart. */
-static struct {
-    const char *env, *key;
-    float def;
-    float *f;                       /* exactly one of f/u is set */
-    uint32_t *u;
-    bool env_set;
-} tunables[] = {
-    { "GFCOOL_FLOW_HEATER_PCT", "cool_flow_heater_pct",
-      FLOW_HEATER_PCT,        NULL,            &flow_heater_pct },
-    { "GFCOOL_FLOW_CHECK_S",    "cool_flow_check_s",
-      FLOW_CHECK_S,           NULL,            &flow_check_s },
-    { "GFCOOL_RECHECK_S",       "cool_recheck_s",
-      FLOW_RECHECK_S,         NULL,            &flow_recheck_s },
-    { "GFCOOL_COOLDOWN_S",      "cool_cooldown_s",
-      COOLDOWN_SMOKE_S,       NULL,            &smoke_s },
-    { "GFCOOL_COOLDOWN_MAX_S",  "cool_cooldown_max_s",
-      COOLDOWN_MAX_S,         NULL,            &cooldown_max_s },
-    { "GFCOOL_TEMP_MAX",        "cool_temp_max",
-      TEMP_MAX_C_DEFAULT,     &temp_max_c,     NULL },
-    { "GFCOOL_TEMP_RESUME",     "cool_temp_resume",
-      TEMP_RESUME_C_DEFAULT,  &temp_resume_c,  NULL },
-    { "GFCOOL_FLOW_RISE",       "cool_flow_rise",
-      FLOW_FAULT_RISE_C,      &flow_fault_rise, NULL },
-    { "GFCOOL_CONFIRM_MAX_S",   "cool_confirm_max_s",
-      FLOW_CONFIRM_MAX_S,     NULL,            &confirm_max_s },
-};
+/* ------------------------------------------------------- job reports */
 
-static void cool_conf_reload (void)
+/* One fire-and-forget POST on the protocol thread. localhost:
+ * connection refused returns immediately when forgectrl is down; the
+ * short timeouts bound the cost when it is wedged. */
+static void report_send (const char *mode, bool armed)
 {
-    for(size_t i = 0; i < sizeof(tunables) / sizeof(tunables[0]); i++) {
-        if(tunables[i].env_set)
-            continue;
-        float v = gfio_conf_read_float(tunables[i].key, tunables[i].def);
-        if(tunables[i].f)
-            *tunables[i].f = v;
-        else
-            *tunables[i].u = v < 0.0f ? 0 : (uint32_t)v;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if(fd < 0)
+        return;
+
+    struct timeval tv = { 0, REPORT_TIMEOUT_MS * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)http_port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if(connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+        char req[192];
+        int n = snprintf(req, sizeof(req),
+            "POST /cool/state?mode=%s&armed=%d HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\nConnection: close\r\n"
+            "Content-Length: 0\r\n\r\n", mode, armed ? 1 : 0);
+        if(write(fd, req, (size_t)n) == n) {
+            char resp[128];
+            (void)!read(fd, resp, sizeof(resp));    /* let the ack land */
+        }
     }
+    close(fd);
 }
+
+static const char *report_mode (void)
+{
+    if(coolant_reported.flood || laser_on_window)
+        return "run";
+    /* After a run: the engine owns the cooldown phases; "cooldown"
+     * tells it the job just ended vs. a machine that was never
+     * running. Cleared once grbl is back at idle. */
+    if(was_run && (state_get() & (STATE_CYCLE | STATE_HOLD)))
+        return "cooldown";
+    return "idle";
+}
+
+static void report_now (void)
+{
+    const char *mode = report_mode();
+    if(!strcmp(mode, "idle"))
+        was_run = false;
+    report_send(mode, laser_on_window);
+    next_report_ms = mono_ms() + REPORT_PERIOD_MS;
+}
+
+/* ---------------------------------------------------------- verdict */
+
+/* Minimal field extraction from the engine's fixed JSON (we own the
+ * writer; keys are matched, order is not assumed). */
+static bool json_bool (const char *body, const char *key)
+{
+    char pat[24];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = strstr(body, pat);
+    return p && !strncmp(p + strlen(pat), "true", 4);
+}
+
+static bool json_num (const char *body, const char *key, double *out)
+{
+    char pat[24];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = strstr(body, pat);
+    if(!p)
+        return false;
+    *out = atof(p + strlen(pat));
+    return true;
+}
+
+static void json_str (const char *body, const char *key, char *out, size_t len)
+{
+    char pat[24];
+    out[0] = '\0';
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p = strstr(body, pat);
+    if(!p)
+        return;
+    p += strlen(pat);
+    const char *e = strchr(p, '"');
+    size_t n = e ? (size_t)(e - p) : 0;
+    if(n >= len)
+        n = len - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+}
+
+/* Read + parse the verdict file; refresh the cached flags. A missing
+ * or unparsable file, or a stale ts_mono, leaves the cache to expire:
+ * fire blocked, hold on. */
+static void verdict_read (void)
+{
+    char body[384];
+    FILE *f = fopen(VERDICT_FILE, "r");
+    if(!f)
+        return;
+    size_t n = fread(body, 1, sizeof(body) - 1, f);
+    fclose(f);
+    body[n] = '\0';
+
+    double ts_mono;
+    if(!json_num(body, "ts_mono", &ts_mono))
+        return;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double age = (double)ts.tv_sec + ts.tv_nsec / 1e9 - ts_mono;
+    if(age < 0.0 || age > VERDICT_MAX_AGE_MS / 1000.0)
+        return;     /* stale publisher; let the cache expire */
+
+    v_hold = json_bool(body, "hold");
+    v_resume_ok = json_bool(body, "resume_ok");
+    v_fire_ok = json_bool(body, "fire_ok");
+    json_str(body, "reason", v_reason, sizeof(v_reason));
+    v_fresh_until_ms = mono_ms() +
+        (uint32_t)(VERDICT_MAX_AGE_MS - (uint32_t)(age * 1000.0));
+}
+
+static bool verdict_fresh (void)
+{
+    return (int32_t)(mono_ms() - v_fresh_until_ms) < 0;
+}
+
+/* Stale verdict while the laser is armed: the engine is gone with the
+ * laser hot. Gate + hold happen through the normal paths (freshness);
+ * the fans need the one direct write nobody else can make now. */
+static void fallback_fans (void)
+{
+    gfio_wr_attr("head/air_assist_pwm", FB_AIR_ASSIST);
+    gfio_wr_attr("thermal/exhaust_pwm", FB_EXHAUST);
+    gfio_wr_attr("thermal/intake_pwm", FB_INTAKE);
+}
+
+/* ---------------------------------------------------------------- api */
 
 void gfcool_init (void)
 {
-    const char *opt;
-
-    for(size_t i = 0; i < sizeof(tunables) / sizeof(tunables[0]); i++) {
-        if((opt = getenv(tunables[i].env))) {
-            tunables[i].env_set = true;
-            if(tunables[i].f)
-                *tunables[i].f = (float)atof(opt);
-            else
-                *tunables[i].u = (uint32_t)atoi(opt);
-        }
-    }
-    cool_conf_reload();
-
-    gfio_wr_attr("thermal/water_pump_on", "1");
-    gfio_wr_attr("thermal/tec_on", "0");
-    gfio_wr_attr("head/purge_air", "1");
-    heater_set_pct(0);
-    fans_idle();
-
-    next_temp_check = wall_s() + 5.0;
-}
-
-/* The effective flood state is the sender's M8/M9 OR'd with the laser
- * armed window: fire must never run without the cut airflow and the
- * flow interrogation that only lives inside a flood session. */
-static void flood_apply (bool on)
-{
-    if(on) {
-        cool_conf_reload();             /* GUI changes apply per job */
-        cool_state = Cool_Run;
-        fans_run();
-        if(flow_verdict == Flow_Suspect)
-            flow_suspect_since = wall_s();  /* budget is per flood session */
-        /* Request a check at job start; the poll starts it once the
-         * loop is settled, then repeats it on the re-check cadence. */
-        if(flow_check_s > 0 && !flow_check_active && !flow_check_pending) {
-            flow_check_pending = true;
-            flow_pending_since = wall_s();
-            flow_settle_warned = false;
-        }
-    } else if(cool_state == Cool_Run) {
-        cool_state = Cool_Smoke;
-        phase_until = wall_s() + (double)smoke_s;
-        flow_check_pending = false;
-        if(flow_check_active) {     /* job ended before the verdict */
-            flow_check_active = false;
-            heater_set_pct(0);
-        }
-    }
+    const char *v = getenv("FORGECTRL_PORT");
+    if(v && atoi(v) > 0 && atoi(v) < 65536)
+        http_port = atoi(v);
+    next_report_ms = mono_ms();
+    next_verdict_ms = mono_ms();
 }
 
 void gfcool_coolant_set (coolant_state_t state)
 {
+    bool was = coolant_reported.flood || laser_on_window;
     coolant_reported = state;
-    flood_apply(state.flood || laser_on_window);
-}
-
-void gfcool_laser_armed (bool armed)
-{
-    if(laser_on_window == armed)
-        return;
-    laser_on_window = armed;
-    flood_apply(coolant_reported.flood || armed);
-}
-
-bool gfcool_fire_ok (void)
-{
-    return flow_verdict != Flow_Fault && !over_temp_gate;
-}
-
-/* Safe posture on a flow SUSPECT/FAULT verdict inside an armed laser
- * window: hold the cycle (laser mode drops the spindle in hold) with
- * the run airflow already on. A cleared suspicion auto-resumes; a
- * FAULT leaves the hold - and the fire gate - for the operator. */
-static void flow_safe_posture (void)
-{
-    if(laser_on_window && state_get() == STATE_CYCLE && !hold_ours && !flow_hold) {
-        flow_hold = true;
-        protocol_enqueue_realtime_command(CMD_FEED_HOLD);
-        warn("laser job held for the coolant flow verdict");
-    }
-}
-
-static void flow_posture_stand_down (void)
-{
-    if(flow_hold) {
-        flow_hold = false;
-        if((state_get() & STATE_HOLD) && !hold_ours) {
-            warn("coolant flow verdict clean - resuming");
-            protocol_enqueue_realtime_command(CMD_CYCLE_START);
-        }
+    if((state.flood || laser_on_window) != was) {
+        if(!was)
+            was_run = true;
+        report_now();
     }
 }
 
@@ -487,233 +278,94 @@ coolant_state_t gfcool_coolant_get (void)
     return coolant_reported;
 }
 
+void gfcool_laser_armed (bool armed)
+{
+    if(laser_on_window == armed)
+        return;
+    bool was = coolant_reported.flood || laser_on_window;
+    laser_on_window = armed;
+    if((coolant_reported.flood || armed) != was) {
+        if(!was)
+            was_run = true;
+        report_now();
+    }
+}
+
+bool gfcool_fire_ok (void)
+{
+    return v_fire_ok && verdict_fresh();
+}
+
 void gfcool_poll (void)
 {
-    double now = wall_s();
+    uint32_t now = mono_ms();
 
-    if(now < next_temp_check)
-        goto phases;
-    next_temp_check = now + 1.0;
+    if((int32_t)(now - next_verdict_ms) >= 0) {
+        next_verdict_ms = now + 1000;
+        verdict_read();
 
-    if(flow_hold && !(state_get() & STATE_HOLD))
-        flow_hold = false;      /* operator resumed or reset; their call */
-
-    float down, up;
-    bool have_down = read_temp("pic/water_temp_1", &down);
-    bool have_up = read_temp("pic/water_temp_2", &up);
-
-    if(have_up) {
+        bool fresh = verdict_fresh();
         sys_state_t st = state_get();
 
-        /* Fire gate with hysteresis: gated over the run ceiling, back
-         * in service under the resume gate. */
-        over_temp_gate = up > (over_temp_gate ? temp_resume_c : temp_max_c);
-
-        /* Over-temp while executing: factory-style pause. grblHAL will
-         * not enter HOLD from a jog (state_machine.c refuses it - jogs
-         * are canceled, never held), so: cycles get a feed hold with
-         * auto-resume; jogs get a jog-cancel (nothing to resume). Cooling
-         * airflow is forced on either way. */
-        if(up > temp_max_c && st == STATE_CYCLE && !hold_ours) {
-            hold_ours = true;
-            protocol_enqueue_realtime_command(CMD_FEED_HOLD);
-            if(cool_state != Cool_Run) {
-                fans_cool();
-                forced_cool = true;
-            }
-            char msg[80];
-            snprintf(msg, sizeof(msg),
-                     "coolant %.1f C over %.0f C limit - pausing until %.0f C",
-                     up, temp_max_c, temp_resume_c);
-            warn(msg);
-        } else if(up > temp_max_c && st == STATE_JOG) {
-            protocol_enqueue_realtime_command(CMD_JOG_CANCEL);
-            if(cool_state != Cool_Run) {
-                fans_cool();
-                forced_cool = true;
-            }
-            if(!temp_warned) {
-                temp_warned = true;
-                char msg[80];
-                snprintf(msg, sizeof(msg),
-                         "coolant %.1f C over %.0f C limit - jog canceled", up, temp_max_c);
-                warn(msg);
-            }
-        } else if(hold_ours) {
-            if(!(st & STATE_HOLD)) {
-                hold_ours = false;  /* operator resumed or reset; stand down */
-                forced_cool = false;
-                fans_apply_phase();
-            } else if(up <= temp_resume_c) {
-                hold_ours = false;
-                forced_cool = false;
-                warn("coolant temperature recovered - resuming");
-                fans_apply_phase();
-                protocol_enqueue_realtime_command(CMD_CYCLE_START);
-            }
-        } else if(up > temp_max_c && !temp_warned) {
-            temp_warned = true;     /* not executing: warn only */
-            char msg[64];
-            snprintf(msg, sizeof(msg), "coolant temperature high: %.1f C", up);
-            warn(msg);
-        } else if(up < temp_max_c - 1.0f) {
-            temp_warned = false;
-            if(forced_cool) {       /* jog-cancel forced cooling; restore */
-                forced_cool = false;
-                fans_apply_phase();
-            }
-        }
-    }
-
-    /* One-shot flow check: how far does the downstream sensor climb
-     * while the heater runs? Flow carries the heat away (plateau);
-     * no flow lets it pile up. The delta is averaged too, but only for
-     * the report - it is the weaker discriminator (see file header). */
-    if(flow_check_active && have_down && have_up) {
-        if(!flow_base_set) {
-            flow_base_down = down;
-            flow_base_set = true;
-        }
-        if(now >= flow_establish_at) {
-            flow_dt_sum += down - up;
-            flow_dt_n++;
-        }
-        if(now >= flow_check_end) {
-            float rise = down - flow_base_down;
-            float dt = flow_dt_n ? flow_dt_sum / (float)flow_dt_n : 0.0f;
-            char msg[112];
-
-            flow_check_active = false;
-            heater_set_pct(0);
-            /* Schedule the next interrogation if the job is still on. */
-            flow_next_check = now + (double)flow_recheck_s;
-
-            if(rise > flow_fault_rise) {
-                if(flow_verdict == Flow_Normal) {
-                    /* First over-limit: open a suspicion and re-check
-                     * as soon as the loop settles instead of waiting
-                     * out the cadence. */
-                    flow_verdict = Flow_Suspect;
-                    flow_suspect_since = now;
-                    flow_check_pending = true;
-                    flow_pending_since = now;
-                    flow_settle_warned = false;
-                    snprintf(msg, sizeof(msg),
-                             "COOLANT FLOW SUSPECT: heater rise %.1f C (limit %.1f, dT %.1f) - re-checking",
-                             rise, flow_fault_rise, dt);
-                } else {
-                    flow_verdict = Flow_Fault;
-                    snprintf(msg, sizeof(msg),
-                             "COOLANT FLOW FAULT: heater rise %.1f C (limit %.1f, dT %.1f) - check the pump",
-                             rise, flow_fault_rise, dt);
+        if(!fresh) {
+            /* No verdict: fire is blocked (freshness), motion holds,
+             * and an armed window gets the fallback airflow. */
+            if(laser_on_window || coolant_reported.flood) {
+                if(!stale_warned) {
+                    stale_warned = true;
+                    warn("cooling service lost - fire blocked, holding");
                 }
-                warn(msg);
-                flow_safe_posture();
-            } else if(flow_verdict != Flow_Normal) {
-                snprintf(msg, sizeof(msg),
-                         flow_verdict == Flow_Suspect
-                           ? "coolant flow suspicion cleared (heater rise %.1f C, dT %.1f C)"
-                           : "coolant flow recovered (heater rise %.1f C, dT %.1f C)",
-                         rise, dt);
-                flow_verdict = Flow_Normal;
-                report_message(msg, Message_Info);
-                fprintf(stderr, "gfcool: %s\n", msg);
-                flow_posture_stand_down();
-                if(++flow_episodes == FLOW_TREND_N) {
-                    snprintf(msg, sizeof(msg),
-                             "%u coolant flow suspicions this job - check the pump and coolant level",
-                             (unsigned)flow_episodes);
-                    warn(msg);
+                if(st == STATE_CYCLE && !hold_ours) {
+                    hold_ours = true;
+                    protocol_enqueue_realtime_command(CMD_FEED_HOLD);
+                }
+                if(laser_on_window && !fallback_done) {
+                    fallback_done = true;
+                    fallback_fans();
+                }
+            }
+        } else {
+            if(stale_warned) {
+                stale_warned = false;
+                fallback_done = false;
+                report_message("cooling service restored", Message_Info);
+                fprintf(stderr, "gfcool: cooling service restored\n");
+            }
+
+            /* Relay the engine's reason to the sender once per change. */
+            if(v_reason[0] && strcmp(v_reason, v_reason_shown))
+                warn(v_reason);
+            strcpy(v_reason_shown, v_reason);
+
+            if(v_hold) {
+                if(st == STATE_CYCLE && !hold_ours) {
+                    hold_ours = true;
+                    protocol_enqueue_realtime_command(CMD_FEED_HOLD);
+                } else if(st == STATE_JOG) {
+                    /* grblHAL never holds a jog; cancel it instead. */
+                    protocol_enqueue_realtime_command(CMD_JOG_CANCEL);
+                    if(!jog_warned) {
+                        jog_warned = true;
+                        warn("jog canceled on the cooling verdict");
+                    }
                 }
             } else {
-                snprintf(msg, sizeof(msg),
-                         "coolant flow verified (heater rise %.1f C, dT %.1f C)", rise, dt);
-                report_message(msg, Message_Info);
-                fprintf(stderr, "gfcool: %s\n", msg);
+                jog_warned = false;
+                if(hold_ours) {
+                    if(!(st & STATE_HOLD))
+                        hold_ours = false;  /* operator resumed or reset */
+                    else if(v_resume_ok) {
+                        hold_ours = false;
+                        report_message("cooling verdict clean - resuming",
+                                       Message_Info);
+                        fprintf(stderr, "gfcool: resuming\n");
+                        protocol_enqueue_realtime_command(CMD_CYCLE_START);
+                    }
+                }
             }
         }
-    } else if(cool_state == Cool_Run && flow_check_s > 0 && flow_recheck_s > 0
-               && !flow_check_pending && now >= flow_next_check) {
-        flow_check_pending = true;  /* periodic re-interrogation mid-job */
-        flow_pending_since = now;
-        flow_settle_warned = false;
     }
 
-    /* A suspicion may not sit unresolved while a job runs: no verdict
-     * within the budget (settle gate starved - itself consistent with
-     * stagnation, which decays by conduction only) fails safe. An
-     * in-flight check is left to deliver its real verdict instead. */
-    if(flow_verdict == Flow_Suspect && !flow_check_active
-       && cool_state == Cool_Run
-       && now - flow_suspect_since > (double)confirm_max_s) {
-        char msg[96];
-        flow_verdict = Flow_Fault;
-        snprintf(msg, sizeof(msg),
-                 "COOLANT FLOW FAULT: no clean re-check within %u s - check the pump",
-                 (unsigned)confirm_max_s);
-        warn(msg);
-        flow_safe_posture();
-    }
-
-    /* Track downstream history for the stationarity test below. It is
-     * only meaningful while the heater is off, so a running check
-     * invalidates it. */
-    if(have_down) {
-        if(flow_check_active)
-            down_hist_n = 0;
-        else {
-            down_hist[down_hist_n % FLOW_SETTLE_WIN] = down;
-            down_hist_n++;
-        }
-    }
-
-    /* Gate: a pending check only starts from a settled loop - sensors
-     * in agreement AND the downstream reading stationary. */
-    if(flow_check_pending && !flow_check_active && have_down && have_up) {
-        bool stationary = down_hist_n >= FLOW_SETTLE_WIN;
-        if(stationary) {
-            uint32_t base = down_hist_n - FLOW_SETTLE_WIN;
-            float old_sum = 0.0f, new_sum = 0.0f;
-            for(uint32_t i = 0; i < 7; i++)
-                old_sum += down_hist[(base + i) % FLOW_SETTLE_WIN];
-            for(uint32_t i = 7; i < FLOW_SETTLE_WIN; i++)
-                new_sum += down_hist[(base + i) % FLOW_SETTLE_WIN];
-            stationary = fabsf(new_sum / 8.0f - old_sum / 7.0f) <= FLOW_SETTLE_DRIFT_C;
-        }
-        if(stationary && fabsf(down - up) <= FLOW_SETTLE_DT_C) {
-            flow_check_pending = false;
-            flow_check_start(now);
-        } else if(!flow_settle_warned && now - flow_pending_since > FLOW_SETTLE_WARN_S) {
-            flow_settle_warned = true;
-            char msg[96];
-            snprintf(msg, sizeof(msg),
-                     "flow check deferred: loop not settled (dT %.1f C, %s)",
-                     down - up, stationary ? "drifting" : "sensors disagree");
-            warn(msg);
-        }
-    }
-
-phases:
-    if(cool_state == Cool_Smoke && now >= phase_until) {
-        float up2;
-        if(read_temp("pic/water_temp_2", &up2) && up2 > temp_resume_c) {
-            cool_state = Cool_Thermal;
-            phase_until = now + (double)cooldown_max_s;
-            fans_cool();
-        } else {
-            cool_state = Cool_Idle;
-            fans_idle();
-            flow_episodes = 0;
-        }
-    } else if(cool_state == Cool_Thermal) {
-        float up2;
-        bool recovered = read_temp("pic/water_temp_2", &up2) && up2 <= temp_resume_c;
-        if(recovered || now >= phase_until) {
-            if(!recovered)
-                warn("thermal cooldown timed out above the resume gate");
-            cool_state = Cool_Idle;
-            fans_idle();
-            flow_episodes = 0;
-        }
-    }
+    if((int32_t)(now - next_report_ms) >= 0)
+        report_now();
 }
