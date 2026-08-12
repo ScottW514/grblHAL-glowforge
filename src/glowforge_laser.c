@@ -285,7 +285,7 @@ void gflaser_poll (void)
 
     /* The armed window closes after a spindle-off idle grace; any job
      * activity (or a lingering M3) keeps it open. */
-    if(cur_state.on || !(st & (STATE_IDLE | STATE_CHECK_MODE))) {
+    if(cur_state.on || !(st == STATE_IDLE || st == STATE_CHECK_MODE)) {
         disarm_at = 0.0;
         return;
     }
