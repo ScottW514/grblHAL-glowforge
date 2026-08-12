@@ -552,6 +552,14 @@ static void ship_pass (void)
 
     if(start_run && gf.active && !gf.failed) {
         char state[16] = "";
+        /* The kernel parks the FIRE line Hi-Z at every run end (its
+         * laser-safe stop) and only a latch-unlock write restores SDMA
+         * drive - the factory flow re-unlocks before every run. An
+         * armed window spanning kernel runs must do the same, or the
+         * next run's fire bits play into a tri-stated pin. */
+        bool relight = laser_armed;
+        if(relight)
+            gfio_wr_attr("cnc/laser_latch", "0");
         if(gfio_wr_attr("cnc/run", "1") != 0) {
             gfio_rd_attr("cnc/state", state, sizeof(state));
             if(strcmp(state, "underrun") == 0 && !laser_armed) {
@@ -574,6 +582,8 @@ static void ship_pass (void)
                 fault_flag = true;
             }
         }
+        if(relight && !laser_armed)
+            gfio_wr_attr("cnc/laser_latch", "1");  /* disarmed meanwhile - relock */
     }
 }
 
@@ -758,6 +768,9 @@ void gf_stream_init (void)
 {
     const char *dev = getenv("GFSINK"), *opt;
     char val[16];
+
+    /* Hardware writes stay gated off for null-sink instances. */
+    gfio_set_hw(dev != NULL && *dev != '\0');
 
     gf.rate = (opt = getenv("GFSINK_RATE")) ? (uint32_t)atoi(opt) : 28160;
     uint32_t depth_ms = (opt = getenv("GFSINK_DEPTH_MS")) ? (uint32_t)atoi(opt) : 200;
