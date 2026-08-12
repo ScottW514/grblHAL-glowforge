@@ -371,6 +371,10 @@ void gfcool_poll (void)
         }
     }
 
-    if((int32_t)(now - next_report_ms) >= 0)
+    /* One reporter per machine (SERVICES.md): a gfcloud homing session
+     * hands the machine to gfhome, which reports its own job state -
+     * this client's idle reports would fight it, resetting the engine's
+     * per-job profile and thrashing the flood state per motion. */
+    if((int32_t)(now - next_report_ms) >= 0 && state_get() != STATE_HOMING)
         report_now();
 }
