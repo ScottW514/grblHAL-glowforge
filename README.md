@@ -30,9 +30,27 @@ Machine constants (steps/mm, max rates, accelerations) are measured from
 the factory machine and its pulse streams — see `src/boards/glowforge.h`
 for sources.
 
-**Laser fire is hard-locked out** (the kernel laser latch is forced locked
-and the laser bit is never emitted). Laser control is a later, safety-gated
-milestone; the hardware safety chain remains authoritative regardless.
+**Laser control** (`src/glowforge_laser.c`): grblHAL laser mode (M3/M4,
+`$32`) maps spindle power onto the pulse stream's power bytes and fire
+bits. The first laser-on of a job requires the **operator's physical
+button press** (the kernel laser latch stays locked until then, and
+relocks on disarm/alarm/reset); fire only ever rides motion segments of
+laser blocks, and an armed underrun fails safe. The hardware safety
+AND-chain remains authoritative regardless.
+
+**Cooling** is enforced in-process but owned by the forgectrl cooling
+engine: the driver reports job state, gates fire and issues hold/resume
+from the engine's published verdict (a missing or stale verdict reads as
+fire-blocked), and carries a compiled-in fallback fan write for the case
+where the engine is provably absent while the laser is armed. The
+contract is forgectrl `docs/SERVICES.md`.
+
+Under the ForgeFIRM image the driver runs as a **supervised child of
+forgectrl** and receives `/dev/glowforge` as a broker-inherited fd
+(`GF_PULSE_FD`) — handovers such as the `$H` homing session then never
+close the device or cycle the 40 V motor rail. Standalone (no
+`GF_PULSE_FD`), it opens the device itself and every takeover runs a
+deliberate rail-off settle (`rail_settle_s`).
 
 ## Building
 
