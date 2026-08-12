@@ -12,6 +12,7 @@
 
 // Attribute paths are relative to /sys/glowforge/ (e.g. "cnc/state",
 // "pic/x_step_current"). All return 0 on success, -1 on failure.
+void gfio_set_hw (bool active);
 int gfio_wr_attr (const char *attr, const char *val);
 int gfio_rd_attr (const char *attr, char *buf, size_t len);
 

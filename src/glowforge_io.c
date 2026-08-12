@@ -28,10 +28,23 @@
 #define Y_CURRENT_RUN  "22"
 #define Y_CURRENT_HOLD "5"
 
+/* Null-sink instances must never touch the machine: on a dev host the
+ * sysfs opens simply fail, but on the board a "no hardware I/O" test
+ * process would otherwise drive the real laser latch and analog config.
+ * Writes are gated until the instance declares hardware ownership. */
+static bool gfio_hw = false;
+
+void gfio_set_hw (bool active)
+{
+    gfio_hw = active;
+}
+
 int gfio_wr_attr (const char *attr, const char *val)
 {
     char path[128];
     int fd, ret;
+    if(!gfio_hw)
+        return 0;
     snprintf(path, sizeof(path), GF_SYSFS "%s", attr);
     if((fd = open(path, O_WRONLY)) < 0)
         return -1;
