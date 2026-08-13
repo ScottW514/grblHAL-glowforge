@@ -38,6 +38,14 @@ relocks on disarm/alarm/reset); fire only ever rides motion segments of
 laser blocks, and an armed underrun fails safe. The hardware safety
 AND-chain remains authoritative regardless.
 
+**Safety inputs** (`src/glowforge_switches.c`): the lid switches and the
+remote-interlock loop drive the core's safety-door signal, so opening the
+lid mid-job parks it in the door state and closing it resumes — matching
+what the hardware chain does to the beam. The e-stop bit is a sense line
+that rests active and drops during any stepper motion on this board, so it
+gates nothing unless `estop_halts_motion` is set in the machine settings
+(for machines retrofitted with a real e-stop circuit).
+
 **Cooling** is enforced in-process but owned by the forgectrl cooling
 engine: the driver reports job state, gates fire and issues hold/resume
 from the engine's published verdict (a missing or stale verdict reads as

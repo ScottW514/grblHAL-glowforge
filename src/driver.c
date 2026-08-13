@@ -39,6 +39,7 @@
 #include "glowforge_cooling.h"
 #include "glowforge_homing.h"
 #include "glowforge_laser.h"
+#include "glowforge_switches.h"
 #include "eeprom.h"
 #include "grbl_eeprom_extensions.h"
 
@@ -162,7 +163,7 @@ static void stepperEnable (axes_signals_t enable, bool hold)
  * homing session, switches falls through to the core cycle once the
  * planned physical switches exist - until then the limit signals are
  * stubbed and core homing stays disabled (boards/glowforge.h). Control
- * inputs (door/estop) are a later milestone. */
+ * inputs come from the machine's switch device (glowforge_switches.c). */
 
 static void limitsEnable (bool on, axes_signals_t homing_cycle)
 {
@@ -178,8 +179,7 @@ static limit_signals_t limitsGetState (void)
 
 static control_signals_t systemGetState (void)
 {
-    control_signals_t signals = {0};
-    return signals;
+    return gfsw_get_state();
 }
 
 static void coolantSetState (coolant_state_t mode)
@@ -273,6 +273,7 @@ static void glowforge_process_realtime (uint_fast16_t state)
 
     gfcool_poll();
     gflaser_poll();
+    gfsw_poll();
 
     if(exit_requested && state != STATE_CYCLE && state != STATE_JOG && state != STATE_HOMING)
         exit(EXIT_SUCCESS);
@@ -308,6 +309,7 @@ bool driver_init (void)
     gfcool_init();
     gfhome_init();
     gflaser_init();
+    gfsw_init();
 
     hal.info = "Glowforge";
     hal.driver_version = "260809";
