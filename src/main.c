@@ -139,9 +139,12 @@ int main (int argc, char *argv[])
     }
 
     // Lock text and data so the SCHED_FIFO shipper never takes a major
-    // page fault mid-stream; best effort (a dev host without the
-    // privilege just runs unlocked).
-    if(mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+    // page fault mid-stream. Root only: CAP_IPC_LOCK exempts the memlock
+    // limit there, while under a finite RLIMIT_MEMLOCK a successful
+    // MCL_FUTURE makes every later thread-stack mmap count against the
+    // limit and thread creation fails outright - strictly worse than
+    // running unlocked.
+    if(geteuid() == 0 && mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
         fprintf(stderr, "mlockall unavailable: %s (running unlocked)\n",
                 strerror(errno));
 
