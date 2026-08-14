@@ -76,6 +76,7 @@
 #include <unistd.h>
 
 #include "stepper_stream.h"
+#include "glowforge_homing.h"
 #include "glowforge_io.h"
 #include "driver.h"
 
@@ -630,8 +631,12 @@ static void ship_pass (void)
         if(gfio_wr_attr("cnc/run", "1") != 0) {
             gfio_rd_attr("cnc/state", state, sizeof(state));
             if(strcmp(state, "underrun") == 0 && !laser_armed) {
-                /* late detection of a starve: ack, then retry once */
-                fprintf(stderr, "gfstream: kernel underrun; recovering\n");
+                /* Late detection of a starve: ack, then retry once. The
+                 * counters no longer prove position, so the homing
+                 * anchor must not survive the retry. */
+                fprintf(stderr, "gfstream: kernel underrun; recovering - "
+                                "position untrusted, re-home before an armed job\n");
+                gfhome_invalidate();
                 gfio_wr_attr("cnc/stop", "1");
                 gfio_wr_attr("cnc/run", "1");
             } else if(strcmp(state, "underrun") == 0) {
@@ -655,6 +660,35 @@ static void ship_pass (void)
     }
 }
 
+/* Mid-run fault detection at the shipper's cadence: the ring accepting
+ * writes says nothing about playback, so a starve or a stepper-driver
+ * fault would otherwise leave the sender planning and counting against
+ * a motionless gantry until the NEXT run start. cnc/state is cheap to
+ * read (free is the attr the UAPI forbids polling); read outside
+ * gf.lock. driver.c turns the fault flag into disarm + anchor
+ * invalidation + alarm on the protocol thread. */
+static void check_kernel_state (void)
+{
+    bool running;
+
+    pthread_mutex_lock(&gf.lock);
+    running = gf.active && gf.kernel_running && !gf.failed && !gf.suspended;
+    pthread_mutex_unlock(&gf.lock);
+    if(!running)
+        return;
+
+    char state[16] = "";
+    if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0)
+        return;
+    if(strcmp(state, "underrun") == 0 || strcmp(state, "fault") == 0) {
+        fprintf(stderr, "gfstream: kernel %s mid-run - alarming\n", state);
+        pthread_mutex_lock(&gf.lock);
+        gf.failed = true;
+        pthread_mutex_unlock(&gf.lock);
+        fault_flag = true;
+    }
+}
+
 static void *shipper_thread (void *arg)
 {
     (void)arg;
@@ -667,6 +701,7 @@ static void *shipper_thread (void *arg)
 
     while(!quit) {
         ship_pass();
+        check_kernel_state();
         sleep_ns(SHIP_PERIOD_NS);
     }
 
