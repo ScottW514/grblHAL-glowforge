@@ -26,17 +26,24 @@
        operator presses the physical button (EV_SW bit 2 on the input
        device), a soft reset aborts, or the timeout expires.
 
-  The armed window then persists across the job (S changes and M5/M3
-  toggles do not re-prompt) and closes - relocking the latch - after
-  laser_disarm_s of spindle-off idle, or immediately on alarm, homing,
-  reset or a stream fault. While unarmed or gated, fire requests are
+  The armed window is JOB-based: it persists across the job (S changes
+  and M5/M3 toggles do not re-prompt) and closes - relocking the
+  latch - at program end (M2/M30/%), whenever the sender's connection
+  changes (the consent belonged to the displaced session), after
+  laser_disarm_s of spindle-off grace (counting down in Idle and in a
+  job parked in Hold, Door or Tool Change - only a cycle, a jog or a
+  lingering M3 keeps the window open), or immediately on alarm, homing,
+  reset or a stream fault. The coolant fire gate is re-checked after
+  the button wait, so a window can never open against a verdict that
+  went bad during the wait. While unarmed or gated, fire requests are
   suppressed at the stream and reported.
 
   Config keys (shared machine config, re-read at each arm):
-    laser_button_timeout_s   button wait budget (default 300; 0 = no
-                             timeout, wait until pressed or aborted)
-    laser_disarm_s           spindle-off idle grace before the armed
-                             window closes (default 60)
+    laser_button_timeout_s   button wait budget (default 300; clamped
+                             to 1-3600 - out-of-range values fall back
+                             to the default, never wait-forever)
+    laser_disarm_s           spindle-off grace before the armed window
+                             closes (default 60)
 
   grblHAL is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -89,6 +96,9 @@ static spindle_pwm_t spindle_pwm;
 static bool hw_active;              /* GFSINK set: real device + button */
 static _Atomic bool laser_ok = false;   /* armed window open */
 static double disarm_at;            /* 0 = no grace running */
+static unsigned armed_client_gen;   /* sender session the arm belongs to */
+static _Atomic bool disarm_request = false; /* program end: close the window */
+static on_program_completed_ptr on_program_completed;
 
 /* Producer-thread fire suppression, reported from the protocol thread. */
 enum { Suppress_None = 0, Suppress_Unarmed, Suppress_Coolant };
@@ -151,6 +161,7 @@ void gflaser_disarm (void)
     button_led(0);
     gfcool_laser_armed(false);
     disarm_at = 0.0;
+    disarm_request = false;
     report_message("laser disarmed - latch locked", Message_Info);
 }
 
@@ -171,8 +182,13 @@ static bool gflaser_arm (void)
     latch_lock(false);
 
     if(hw_active) {
+        /* The wait runs with the latch unlocked, so it must always be
+         * bounded: out-of-range values (including 0 and garbage that
+         * parses negative or NaN) fall back to the default. */
         float timeout_s = gfio_conf_read_float("laser_button_timeout_s", BUTTON_TIMEOUT_S_DEFAULT);
-        double deadline = timeout_s > 0.0f ? wall_s() + (double)timeout_s : 0.0;
+        if(!(timeout_s >= 1.0f && timeout_s <= 3600.0f))
+            timeout_s = BUTTON_TIMEOUT_S_DEFAULT;
+        double deadline = wall_s() + (double)timeout_s;
         int fd = open(SWITCH_DEV, O_RDONLY | O_NONBLOCK);
 
         button_led(255);
@@ -184,7 +200,7 @@ static bool gflaser_arm (void)
             if(!pressed) {
                 if(!pump(50000))
                     aborted = true;             /* soft reset during the wait */
-                else if(deadline != 0.0 && wall_s() > deadline) {
+                else if(wall_s() > deadline) {
                     report_message("laser arm timed out waiting for the button", Message_Warning);
                     system_raise_alarm(Alarm_AbortCycle);
                     aborted = true;
@@ -202,8 +218,21 @@ static bool gflaser_arm (void)
         }
     }
 
+    /* Re-check the coolant gate at the moment it matters: the wait can
+     * run for minutes, and the verdict may have gone bad (or stale)
+     * during it. */
+    if(!gfcool_fire_ok()) {
+        latch_lock(true);
+        gfcool_laser_armed(false);
+        report_message("laser fire blocked: coolant flow fault or over-temperature", Message_Warning);
+        system_raise_alarm(Alarm_AbortCycle);
+        return false;
+    }
+
+    disarm_request = false;
     laser_ok = true;
     disarm_at = 0.0;
+    armed_client_gen = serial_client_generation();
     gf_stream_laser_arm(true);
     report_message("laser armed", Message_Info);
 
@@ -291,10 +320,31 @@ void gflaser_poll (void)
         return;
     }
 
-    /* The armed window closes after a spindle-off idle grace; any job
-     * activity (or a lingering M3) keeps it open. */
+    /* A sender change closes the window: the button press that armed
+     * it belonged to the displaced session. */
+    if(serial_client_generation() != armed_client_gen) {
+        gflaser_disarm();
+        return;
+    }
+
+    /* Program end closes the window too - the consent is spent with
+     * the job. The relock waits for the kernel to finish the queue
+     * tail, so the request stays pending until the device is idle. */
+    if(disarm_request) {
+        char state[16] = "";
+        if(!hw_active || (gfio_rd_attr("cnc/state", state, sizeof(state)) == 0 &&
+                           strcmp(state, "idle") == 0)) {
+            gflaser_disarm();
+            return;
+        }
+    }
+
+    /* Otherwise the window closes after a spindle-off grace. The grace
+     * counts down whenever the spindle is off - including a job parked
+     * in Hold, Door or Tool Change - and only a cycle, a jog or a
+     * lingering M3 keeps the window open. */
     spindle_state_t cur = { .value = atomic_load(&cur_state_value) };
-    if(cur.on || !(st == STATE_IDLE || st == STATE_CHECK_MODE)) {
+    if(cur.on || (st & (STATE_CYCLE | STATE_JOG))) {
         disarm_at = 0.0;
         return;
     }
@@ -315,10 +365,26 @@ void gflaser_poll (void)
     }
 }
 
+/* Program end (M2/M30/%): the core calls this on the protocol thread
+ * after protocol_buffer_synchronize, so the planner is drained; the
+ * kernel ring tail may still be playing, hence the deferred close in
+ * gflaser_poll. */
+static void onProgramCompleted (program_flow_t program_flow, bool check_mode)
+{
+    if(!check_mode && laser_ok)
+        disarm_request = true;
+
+    if(on_program_completed)
+        on_program_completed(program_flow, check_mode);
+}
+
 void gflaser_init (void)
 {
     const char *dev = getenv("GFSINK");
     hw_active = dev != NULL && *dev != '\0';
+
+    on_program_completed = grbl.on_program_completed;
+    grbl.on_program_completed = onProgramCompleted;
 
     static const spindle_ptrs_t spindle = {
         .type = SpindleType_PWM,

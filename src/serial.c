@@ -48,6 +48,7 @@ static enqueue_realtime_command_ptr enqueue_realtime_command = protocol_enqueue_
 
 static int listen_fd = -1;
 static int client_fd = -1;
+static unsigned client_generation = 0;  /* bumps on every connect/disconnect */
 static bool stdin_eof = false;  /* stdio mode: stop polling stdin at EOF */
 
 /* Bytes rx_poll() reads from the client per call; serial_wait() only arms
@@ -66,7 +67,13 @@ static void drop_client (void)
     if(client_fd >= 0) {
         close(client_fd);
         client_fd = -1;
+        client_generation++;
     }
+}
+
+unsigned serial_client_generation (void)
+{
+    return client_generation;
 }
 
 //
@@ -245,6 +252,7 @@ static void rx_poll (void)
             int nodelay = 1;
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
             client_fd = fd;
+            client_generation++;
         }
 
         if(client_fd >= 0) {

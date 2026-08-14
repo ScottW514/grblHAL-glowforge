@@ -26,3 +26,7 @@ void serial_poll (void);
 // connection, client RX, or (while output is pending) TX writability, so
 // a coarse idle timeout adds no input latency. Protocol thread only.
 void serial_wait (long timeout_us);
+
+// Client-session generation: bumps on every connect and disconnect, so a
+// consumer can tell that the sender changed between two observations.
+unsigned serial_client_generation (void);
