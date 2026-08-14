@@ -20,7 +20,10 @@
   SPDX-License-Identifier: GPL-3.0-or-later
 */
 
+#ifndef _GNU_SOURCE     /* the build defines it globally; keep this for
+                           standalone compilation */
 #define _GNU_SOURCE     /* ppoll */
+#endif
 
 // grbl headers first: glibc's <sys/stat.h> (via fcntl.h) defines st_mtime
 // as a macro, which must not be in scope when the core's vfs.h declares

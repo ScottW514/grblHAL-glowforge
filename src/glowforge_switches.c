@@ -55,6 +55,7 @@
 */
 
 #include "glowforge_switches.h"
+#include "glowforge_switch_map.h"
 #include "glowforge_io.h"
 
 #include <fcntl.h>
@@ -66,24 +67,14 @@
 
 #define SWITCH_DEV        "/dev/input/event0"
 
-#define SW_BIT_DOORS      3
-#define SW_BIT_ESTOP      4
-#define SW_BIT_INTERLOCK  5
-
-#define SW_BYTES          2
-
 static int sw_fd = -1;
 static bool estop_gates_motion = false;
 static control_signals_t state = {0};
 
-static bool bit_set (const uint8_t *sw, unsigned bit)
-{
-    return !!(sw[bit / 8] & (1u << (bit % 8)));
-}
-
-/* Reads the switch device and maps it onto control signals. Leaves the
-   previous state untouched if the device cannot be read, so a transient
-   read failure cannot fake a door event. */
+/* Reads the switch device and maps it onto control signals (the pure
+   mapping lives in glowforge_switch_map.h, unit-tested on the host).
+   Leaves the previous state untouched if the device cannot be read, so
+   a transient read failure cannot fake a door event. */
 static bool read_signals (control_signals_t *signals)
 {
     uint8_t sw[SW_BYTES] = {0};
@@ -91,10 +82,7 @@ static bool read_signals (control_signals_t *signals)
     if(sw_fd < 0 || ioctl(sw_fd, EVIOCGSW(sizeof(sw)), sw) < 0)
         return false;
 
-    signals->bits = 0;
-    signals->safety_door_ajar = !bit_set(sw, SW_BIT_DOORS) || bit_set(sw, SW_BIT_INTERLOCK);
-    if(estop_gates_motion)
-        signals->e_stop = !bit_set(sw, SW_BIT_ESTOP);
+    *signals = gfsw_map_bits(sw, estop_gates_motion);
 
     return true;
 }

@@ -41,7 +41,7 @@ configure_file(
 
 include(src/grbl/CMakeLists.txt)
 
-add_executable(grblHAL_glowforge
+set(DRIVER_SOURCES
     src/main.c
     src/driver.c
     src/stepper_stream.c
@@ -56,6 +56,15 @@ add_executable(grblHAL_glowforge
     src/platform_linux.c
 )
 
+add_executable(grblHAL_glowforge ${DRIVER_SOURCES})
+
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    # The DRIVER's own sources are warning-free and held to that; the
+    # core submodule is upstream code and is not held to -Werror here.
+    set_source_files_properties(${DRIVER_SOURCES} tests/switch_map_test.c
+        PROPERTIES COMPILE_OPTIONS "-Werror")
+endif()
+
 target_link_libraries(grblHAL_glowforge PRIVATE
     m
     grbl
@@ -67,3 +76,11 @@ target_link_libraries(grblHAL_glowforge PRIVATE
 target_include_directories(grblHAL_glowforge PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 install(TARGETS grblHAL_glowforge RUNTIME DESTINATION bin)
+
+# Host unit test for the EV_SW switch-map decode (the pure mapping in
+# src/glowforge_switch_map.h). Built everywhere, installed nowhere; CI
+# runs it after the build.
+add_executable(switch_map_test tests/switch_map_test.c)
+# Headers only - the test exercises the pure mapping and must not link
+# the core (whose entry points expect the full driver).
+target_include_directories(switch_map_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})

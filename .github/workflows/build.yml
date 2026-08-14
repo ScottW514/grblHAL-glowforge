@@ -12,7 +12,22 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      # Driver sources are -Werror via CMakeLists (the core submodule is
+      # upstream code and is not).
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build -j"$(nproc)"
+      - name: Switch-map decode truth table
+        run: ./build/switch_map_test
+      # The safety harnesses live in the forgefirm repo (scripts/bench/)
+      # and drive the null-sink build over TCP - no hardware, no root.
+      - name: Fetch the test harnesses
+        uses: actions/checkout@v4
+        with:
+          repository: ScottW514/forgefirm
+          path: forgefirm
+      - name: Laser stream emission rules
+        run: python3 forgefirm/scripts/bench/laser_stream_test.py build/grblHAL_glowforge
+      - name: Armed-window lifecycle
+        run: python3 forgefirm/scripts/bench/laser_lifecycle_test.py build/grblHAL_glowforge
