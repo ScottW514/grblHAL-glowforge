@@ -932,6 +932,11 @@ void gf_stream_shutdown (void)
         gfio_wr_attr("cnc/streaming", "0");
         gfio_wr_attr("cnc/halt", "1");
     }
+    /* Under the broker this close is not the final close of the pulse
+     * device, so the kernel's close-relock does not fire; relock
+     * explicitly (a no-op when already locked). */
+    if(gf.active)
+        gfio_wr_attr("cnc/laser_latch", "1");
     if(gf.clamped)
         fprintf(stderr, "gfstream: %llu late events clamped\n",
                 (unsigned long long)gf.clamped);

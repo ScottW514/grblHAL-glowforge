@@ -27,6 +27,7 @@
 
 #include "grbl/grbllib.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -34,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -136,6 +138,13 @@ int main (int argc, char *argv[])
         }
     }
 
+    // Lock text and data so the SCHED_FIFO shipper never takes a major
+    // page fault mid-stream; best effort (a dev host without the
+    // privilege just runs unlocked).
+    if(mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+        fprintf(stderr, "mlockall unavailable: %s (running unlocked)\n",
+                strerror(errno));
+
     platform_init();
 
     if(port) {
@@ -171,7 +180,8 @@ int main (int argc, char *argv[])
     serial_set_listen_fd(listen_fd);
 
     // Do not leave the EEPROM file inconsistent on exit; the stepper
-    // stream registers its own atexit shutdown (kernel halt + unlatch).
+    // stream registers its own atexit shutdown (kernel halt + latch
+    // relock).
     atexit(eeprom_close);
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
