@@ -98,6 +98,8 @@ static _Atomic bool laser_ok = false;   /* armed window open */
 static double disarm_at;            /* 0 = no grace running */
 static unsigned armed_client_gen;   /* sender session the arm belongs to */
 static _Atomic bool disarm_request = false; /* program end: close the window */
+static double disarmed_at;          /* margin for the sample-window lag */
+static double next_emission_check;  /* ~1 Hz witness pacing */
 static on_program_completed_ptr on_program_completed;
 
 /* Producer-thread fire suppression, reported from the protocol thread. */
@@ -162,6 +164,7 @@ void gflaser_disarm (void)
     gfcool_laser_armed(false);
     disarm_at = 0.0;
     disarm_request = false;
+    disarmed_at = wall_s();
     report_message("laser disarmed - latch locked", Message_Info);
 }
 
@@ -309,6 +312,26 @@ void gflaser_poll (void)
         report_message(note == Suppress_Coolant
                         ? "laser fire suppressed: coolant flow fault or over-temperature"
                         : "laser fire suppressed: laser not armed", Message_Warning);
+
+    /* Emission witness (~1 Hz): laser_on_sampled counts the last ~1 s
+     * window's emitting samples on the gated output of the hardware
+     * AND-gate - physical evidence, not a commanded state. Emission
+     * while the window is closed (3 s of margin covers the sample
+     * window's lag past a disarm) is never legitimate. */
+    if(hw_active) {
+        double t = wall_s();
+        if(t >= next_emission_check) {
+            next_emission_check = t + 1.0;
+            char v[8] = "";
+            if(!laser_ok && (disarmed_at == 0.0 || t - disarmed_at > 3.0) &&
+               gfio_rd_attr("cnc/laser_on_sampled", v, sizeof(v)) == 0 &&
+               atoi(v) > 0) {
+                latch_lock(true);
+                report_message("uncommanded laser emission sensed - latch relocked", Message_Warning);
+                system_raise_alarm(Alarm_AbortCycle);
+            }
+        }
+    }
 
     if(!laser_ok)
         return;
