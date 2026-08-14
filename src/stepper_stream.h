@@ -40,6 +40,11 @@ void gf_stream_laser (uint8_t power, bool fire);
 // fire at ~full power.
 void gf_stream_laser_arm (bool armed);
 
+// Serialized cnc/laser_latch write (lock = 1 locks the latch). Every
+// latch write in the process goes through here so the shipper's
+// run-start relight decision is atomic against a concurrent disarm.
+void gf_stream_laser_latch (bool lock);
+
 // hal.driver_reset hook body: abort the stream (drop unshipped backlog,
 // kernel controlled stop). Call only when sys.reset_pending.
 void gf_stream_reset (void);

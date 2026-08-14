@@ -81,7 +81,10 @@
  * PWMSAR against a 127-count period (scope-verified 40 kHz carrier). */
 #define PWM_PERIOD 127
 
-static spindle_state_t cur_state = {0};
+/* Spindle state is written by the protocol thread (set_state) and read
+ * by the stepper producer's segment updates and the poll below: kept in
+ * an atomic byte so an arm edge is never seen half-written. */
+static _Atomic uint8_t cur_state_value = 0;
 static spindle_pwm_t spindle_pwm;
 static bool hw_active;              /* GFSINK set: real device + button */
 static _Atomic bool laser_ok = false;   /* armed window open */
@@ -129,9 +132,12 @@ static bool pump (long timeout_us)
     return protocol_execute_realtime();
 }
 
+/* All latch writes go through the stream engine's serialized writer:
+ * the shipper's run-start relight must be atomic against a concurrent
+ * disarm here, or it can re-unlock a latch this module just locked. */
 static void latch_lock (bool lock)
 {
-    gfio_wr_attr("cnc/laser_latch", lock ? "1" : "0");
+    gf_stream_laser_latch(lock);
 }
 
 void gflaser_disarm (void)
@@ -223,16 +229,18 @@ static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, flo
 {
     (void)spindle; (void)rpm;
 
-    if(state.on && !cur_state.on && !laser_ok && !gflaser_arm())
+    spindle_state_t cur = { .value = atomic_load(&cur_state_value) };
+
+    if(state.on && !cur.on && !laser_ok && !gflaser_arm())
         state.on = Off;                 /* refused/aborted: stay dark */
 
-    cur_state = state;
+    atomic_store(&cur_state_value, state.value);
 }
 
 static spindle_state_t spindleGetState (spindle_ptrs_t *spindle)
 {
     (void)spindle;
-    return cur_state;
+    return (spindle_state_t){ .value = atomic_load(&cur_state_value) };
 }
 
 static uint_fast16_t spindleGetPWM (spindle_ptrs_t *spindle, float rpm)
@@ -285,7 +293,8 @@ void gflaser_poll (void)
 
     /* The armed window closes after a spindle-off idle grace; any job
      * activity (or a lingering M3) keeps it open. */
-    if(cur_state.on || !(st == STATE_IDLE || st == STATE_CHECK_MODE)) {
+    spindle_state_t cur = { .value = atomic_load(&cur_state_value) };
+    if(cur.on || !(st == STATE_IDLE || st == STATE_CHECK_MODE)) {
         disarm_at = 0.0;
         return;
     }

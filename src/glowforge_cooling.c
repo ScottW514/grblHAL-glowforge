@@ -40,7 +40,11 @@
 */
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,7 +61,16 @@
 #include "grbl/report.h"
 #include "grbl/state_machine.h"
 
+/* After the grbl headers: glibc's stat.h (via fcntl.h) defines an
+ * st_mtime macro that would otherwise mangle the field of that name in
+ * vfs.h. */
+#include <fcntl.h>
+
 #define VERDICT_FILE   "/run/forgefirm/cooling.state"
+/* The verdict path is overridable for the host-side stream harness
+ * (GF_VERDICT_FILE), which publishes its own verdicts; a wrong value
+ * only ever blocks fire (missing file = stale = blocked). */
+static const char *verdict_file = VERDICT_FILE;
 /* Reader staleness window per the contract: a verdict older than this
  * is no verdict. The engine publishes at 1 Hz. */
 #define VERDICT_MAX_AGE_MS 2000
@@ -78,13 +91,15 @@ static coolant_state_t coolant_reported = {0};
 static bool laser_on_window = false;    /* armed (glowforge_laser.c) */
 static bool was_run = false;            /* for the cooldown report */
 
-/* Verdict cache. fire_ok is read from the stepper producer thread:
- * 32-bit aligned reads are atomic on this platform, and the deadline
- * comparison makes a stalled poll thread read as fire-blocked. */
-static volatile bool v_fire_ok = false;
-static volatile bool v_hold = false;
-static volatile bool v_resume_ok = false;
-static volatile uint32_t v_fresh_until_ms = 0;
+/* Verdict cache. fire_ok is read from the stepper producer thread; the
+ * deadline comparison makes a stalled poll thread read as fire-blocked.
+ * Ordering: the flags are published BEFORE the deadline (release), and
+ * readers take the deadline first (acquire) - so a reader can never
+ * pair a refreshed deadline with the previous, possibly laxer flags. */
+static _Atomic bool v_fire_ok = false;
+static _Atomic bool v_hold = false;
+static _Atomic bool v_resume_ok = false;
+static _Atomic uint32_t v_fresh_until_ms = 0;
 static char v_reason[112];
 static char v_reason_shown[112];
 
@@ -112,12 +127,14 @@ static void warn (const char *msg)
 
 /* ------------------------------------------------------- job reports */
 
-/* One fire-and-forget POST on the protocol thread. localhost:
- * connection refused returns immediately when forgectrl is down; the
- * short timeouts bound the cost when it is wedged. */
+/* One fire-and-forget POST, on the reporter thread only. localhost:
+ * connection refused returns immediately when forgectrl is down. The
+ * connect is non-blocking and bounded by poll - SO_SNDTIMEO does not
+ * cover connect(), and a wedged listener (full accept backlog) blocks
+ * a plain connect through minutes of SYN retries. */
 static void report_send (const char *mode, bool armed)
 {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if(fd < 0)
         return;
 
@@ -130,7 +147,16 @@ static void report_send (const char *mode, bool armed)
     sa.sin_port = htons((uint16_t)http_port);
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    if(connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+    bool up = connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0;
+    if(!up && errno == EINPROGRESS) {
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+        int err = 0;
+        socklen_t el = sizeof(err);
+        up = poll(&pfd, 1, REPORT_TIMEOUT_MS) == 1 &&
+              getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0;
+    }
+    if(up) {
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
         char req[192];
         int n = snprintf(req, sizeof(req),
             "POST /cool/state?mode=%s&armed=%d HTTP/1.1\r\n"
@@ -142,6 +168,43 @@ static void report_send (const char *mode, bool armed)
         }
     }
     close(fd);
+}
+
+/* Reporter thread: report_send can still block for the socket timeouts,
+ * which is far past the ~10 ms the protocol thread can afford inside a
+ * cycle (a stalled protocol thread starves the segment lookahead while
+ * the shipper keeps cutting). Level-triggered hand-off: the protocol
+ * thread deposits the latest mode+armed and kicks; intermediate states
+ * may be skipped, only the newest matters. */
+static pthread_mutex_t rep_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t rep_cv = PTHREAD_COND_INITIALIZER;
+static char rep_mode[12] = "idle";
+static bool rep_armed = false;
+static unsigned rep_seq = 0;
+
+static void *reporter_thread (void *arg)
+{
+    (void)arg;
+
+    unsigned seen = 0;
+    char mode[12];
+    bool armed;
+
+    pthread_mutex_lock(&rep_mx);
+    for(;;) {
+        while(rep_seq == seen)
+            pthread_cond_wait(&rep_cv, &rep_mx);
+        seen = rep_seq;
+        strcpy(mode, rep_mode);
+        armed = rep_armed;
+        pthread_mutex_unlock(&rep_mx);
+
+        report_send(mode, armed);
+
+        pthread_mutex_lock(&rep_mx);
+    }
+
+    return NULL;
 }
 
 static const char *report_mode (void)
@@ -161,7 +224,15 @@ static void report_now (void)
     const char *mode = report_mode();
     if(!strcmp(mode, "idle"))
         was_run = false;
-    report_send(mode, laser_on_window);
+
+    pthread_mutex_lock(&rep_mx);
+    strncpy(rep_mode, mode, sizeof(rep_mode) - 1);
+    rep_mode[sizeof(rep_mode) - 1] = '\0';
+    rep_armed = laser_on_window;
+    rep_seq++;
+    pthread_cond_signal(&rep_cv);
+    pthread_mutex_unlock(&rep_mx);
+
     next_report_ms = mono_ms() + REPORT_PERIOD_MS;
 }
 
@@ -211,7 +282,7 @@ static void json_str (const char *body, const char *key, char *out, size_t len)
 static void verdict_read (void)
 {
     char body[384];
-    FILE *f = fopen(VERDICT_FILE, "r");
+    FILE *f = fopen(verdict_file, "r");
     if(!f)
         return;
     size_t n = fread(body, 1, sizeof(body) - 1, f);
@@ -228,17 +299,20 @@ static void verdict_read (void)
     if(age < 0.0 || age > VERDICT_MAX_AGE_MS / 1000.0)
         return;     /* stale publisher; let the cache expire */
 
-    v_hold = json_bool(body, "hold");
-    v_resume_ok = json_bool(body, "resume_ok");
-    v_fire_ok = json_bool(body, "fire_ok");
+    /* Flags first, deadline last (release): see the cache comment. */
+    atomic_store_explicit(&v_hold, json_bool(body, "hold"), memory_order_relaxed);
+    atomic_store_explicit(&v_resume_ok, json_bool(body, "resume_ok"), memory_order_relaxed);
+    atomic_store_explicit(&v_fire_ok, json_bool(body, "fire_ok"), memory_order_relaxed);
     json_str(body, "reason", v_reason, sizeof(v_reason));
-    v_fresh_until_ms = mono_ms() +
-        (uint32_t)(VERDICT_MAX_AGE_MS - (uint32_t)(age * 1000.0));
+    atomic_store_explicit(&v_fresh_until_ms,
+        mono_ms() + (uint32_t)(VERDICT_MAX_AGE_MS - (uint32_t)(age * 1000.0)),
+        memory_order_release);
 }
 
 static bool verdict_fresh (void)
 {
-    return (int32_t)(mono_ms() - v_fresh_until_ms) < 0;
+    return (int32_t)(mono_ms() -
+        atomic_load_explicit(&v_fresh_until_ms, memory_order_acquire)) < 0;
 }
 
 /* Stale verdict while the laser is armed: the engine is gone with the
@@ -258,8 +332,22 @@ void gfcool_init (void)
     const char *v = getenv("FORGECTRL_PORT");
     if(v && atoi(v) > 0 && atoi(v) < 65536)
         http_port = atoi(v);
+    const char *vf = getenv("GF_VERDICT_FILE");
+    if(vf && *vf)
+        verdict_file = vf;
     next_report_ms = mono_ms();
     next_verdict_ms = mono_ms();
+
+    /* The reporter runs detached for the process lifetime. If it cannot
+     * start, reports never send and the engine treats the silence as a
+     * stand-down - the failure direction is safe. */
+    pthread_t tid;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    if(pthread_create(&tid, &a, reporter_thread, NULL) != 0)
+        fprintf(stderr, "gfcool: cannot start the reporter thread\n");
+    pthread_attr_destroy(&a);
 }
 
 void gfcool_coolant_set (coolant_state_t state)
@@ -293,7 +381,10 @@ void gfcool_laser_armed (bool armed)
 
 bool gfcool_fire_ok (void)
 {
-    return v_fire_ok && verdict_fresh();
+    /* Freshness (acquire) first: the flag read below is then at least
+     * as new as the verdict that set the deadline. */
+    return verdict_fresh() &&
+            atomic_load_explicit(&v_fire_ok, memory_order_relaxed);
 }
 
 void gfcool_poll (void)

@@ -141,7 +141,8 @@ static struct {
     bool kernel_running;      /* we believe a kernel run is active */
     bool hold_pending;        /* drop to hold currents once kernel idles */
     double hold_poll_at;      /* wall time of the next kernel-state poll */
-    bool failed;              /* unrecoverable; stop feeding */
+    _Atomic bool failed;      /* unrecoverable; stop feeding (read lock-free
+                                 by the entry points; written under gf.lock) */
     double ship_t0;           /* wall time when shipping started */
     uint64_t clamped;         /* events pushed forward (late vs cursor) */
 
@@ -181,6 +182,20 @@ static _Atomic bool armed = false;
 static _Atomic bool quit = false;
 static _Atomic bool fault_flag = false;
 static _Atomic bool laser_armed = false;
+
+/* Serializes every cnc/laser_latch write in this process. The shipper's
+ * run-start relight decision (sample laser_armed, then unlock) must be
+ * atomic against a concurrent disarm's lock, or the relight can re-open
+ * a latch the disarm just closed while FIRE bytes still sit in the
+ * ring. Leaf lock: never held while taking gf.lock or the core lock. */
+static pthread_mutex_t latch_mx = PTHREAD_MUTEX_INITIALIZER;
+
+void gf_stream_laser_latch (bool lock)
+{
+    pthread_mutex_lock(&latch_mx);
+    gfio_wr_attr("cnc/laser_latch", lock ? "1" : "0");
+    pthread_mutex_unlock(&latch_mx);
+}
 
 static double wall_s (void)
 {
@@ -308,16 +323,18 @@ void gf_stream_wakeup (void)
     if(gf.failed)
         return;
 
+    /* Factory run/idle scheme: full torque only while motion plays.
+     * Playback starts a queue-depth behind, so the PIC settles first.
+     * PIC writes ride SPI (milliseconds) - never under gf.lock. */
+    if(gf.active)
+        gfio_currents_run();
+
     pthread_mutex_lock(&gf.lock);
     if(!gf.streaming) {
         gf.streaming = true;
         gf.vticks = 0;
         gf.wall_epoch = wall_s();
-        /* Factory run/idle scheme: full torque only while motion plays.
-         * Playback starts a queue-depth behind, so the PIC settles first. */
         gf.hold_pending = false;
-        if(gf.active)
-            gfio_currents_run();
         if(!gf.kernel_running) {
             /* Fresh stream after a completed one: restart the stream-
              * relative index space (produced/shipped/due must share an
@@ -339,8 +356,13 @@ void gf_stream_wakeup (void)
              * thousands of clamps). The skipped slots ship as
              * zero pads: the machine really was idle for that time. */
             uint64_t due_now = (uint64_t)((wall_s() - gf.ship_t0) * gf.rate) + gf.depth;
-            if(due_now > gf.produced)
+            if(due_now > gf.produced) {
                 gf.produced = due_now;
+                /* The machine was idle across the gap, so the pads must
+                 * ship dark whatever state the ended cycle left behind
+                 * (belt and braces under the go_idle laser-off event). */
+                gf.cur_fire = false;
+            }
         }
         gf.base = gf.produced;
         if(gf.active)
@@ -363,7 +385,30 @@ void gf_stream_go_idle (void)
     armed = false;
 
     pthread_mutex_lock(&gf.lock);
-    gf.streaming = false;
+    if(gf.streaming) {
+        /* The cycle's laser-off must be recorded HERE: the core issues
+         * its spindle-off update after st_go_idle (and only for dynamic
+         * blocks), when this stream no longer accepts transitions - so
+         * without this event the FIRE bit would be inherited by the pad
+         * bytes covering the idle gap to the next cycle: a stationary
+         * full-power dwell burn at every planner starve. */
+        if(gf.cur_fire || gf.lev_head != gf.lev_tail) {
+            uint64_t idx = gf.produced > gf.shipped ? gf.produced : gf.shipped;
+            uint32_t pending = gf.lev_tail - gf.lev_head;
+            struct laser_ev *t = pending ?
+                &gf.lev[(gf.lev_tail - 1) & LEV_MASK] : NULL;
+            if(t && (t->idx >= idx || pending >= LEV_N))
+                t->fire = false;    /* coalesce: the newest event wins */
+            else {
+                gf.lev[gf.lev_tail & LEV_MASK] = (struct laser_ev){
+                    .idx = idx,
+                    .power = t ? t->power : gf.cur_power,
+                    .fire = false };
+                gf.lev_tail++;
+            }
+        }
+        gf.streaming = false;
+    }
     pthread_mutex_unlock(&gf.lock);
 }
 
@@ -425,13 +470,17 @@ static void *producer_thread (void *arg)
                 sched_yield();
         }
 
-        if(n_calls)
+        if(n_calls) {
+            pthread_mutex_lock(&gf.lock);
+            uint64_t clamped_run = gf.clamped - clamped0;
+            pthread_mutex_unlock(&gf.lock);
             fprintf(stderr, "gfstream: run: %llu callbacks in %.3f s (%.1f us/call incl. pacing), "
                     "%llu pace sleeps, max behind %.1f ms, clamped %llu\n",
                     (unsigned long long)n_calls, wall_s() - t_run,
                     (wall_s() - t_run) * 1e6 / (double)n_calls,
                     (unsigned long long)slept, max_behind * 1e3,
-                    (unsigned long long)(gf.clamped - clamped0));
+                    (unsigned long long)clamped_run);
+        }
     }
 
     return NULL;
@@ -455,13 +504,26 @@ static void ship_pass (void)
     uint64_t backlog = gf.produced > gf.shipped ? gf.produced - gf.shipped : 0;
 
     if(!streaming && backlog == 0) {
+        bool drop_hold = false;
         /* stream finished: tell the kernel the next end-of-data is normal */
         if(gf.kernel_running) {
+            if(gf.cur_fire) {
+                /* Termination per the UAPI: a stream's last bytes must
+                 * carry FIRE clear - the end-of-data backstop is the
+                 * underrun safety net, never the normal path. If the
+                 * final commanded byte fired, close the run with one
+                 * dark pad tick. */
+                unsigned char dark = 0x00;
+                if(gf.dump_fd >= 0 && write(gf.dump_fd, &dark, 1) < 0) { /* debug copy only */ }
+                if(gf.active && write(gf.fd, &dark, 1) < 0) { /* end-of-data still lands */ }
+                gf.shipped++;
+                gf.produced = gf.shipped;
+                gf.cur_fire = false;
+            }
             if(gf.active)
                 gfio_wr_attr("cnc/streaming", "0");
             gf.kernel_running = false;   /* kernel drains the queue and idles */
             gf.power_sent = false;       /* the next run resets the duty */
-            gf.cur_fire = false;         /* end-of-data forces FIRE low */
             gf.hold_pending = true;
             gf.hold_poll_at = wall_s() + 0.1;
         }
@@ -473,12 +535,14 @@ static void ship_pass (void)
                 gf.hold_pending = false;
             } else if(gfio_rd_attr("cnc/state", state, sizeof(state)) == 0 &&
                        strcmp(state, "idle") == 0) {
-                gfio_currents_hold();
+                drop_hold = true;
                 gf.hold_pending = false;
             } else
                 gf.hold_poll_at = wall_s() + 0.1;
         }
         pthread_mutex_unlock(&gf.lock);
+        if(drop_hold)
+            gfio_currents_hold();   /* PIC-SPI: never under gf.lock */
         return;
     }
 
@@ -556,7 +620,10 @@ static void ship_pass (void)
          * laser-safe stop) and only a latch-unlock write restores SDMA
          * drive - the factory flow re-unlocks before every run. An
          * armed window spanning kernel runs must do the same, or the
-         * next run's fire bits play into a tri-stated pin. */
+         * next run's fire bits play into a tri-stated pin. The armed
+         * check and the unlock are made atomic against a concurrent
+         * disarm by latch_mx (see gf_stream_laser_latch). */
+        pthread_mutex_lock(&latch_mx);
         bool relight = laser_armed;
         if(relight)
             gfio_wr_attr("cnc/laser_latch", "0");
@@ -584,6 +651,7 @@ static void ship_pass (void)
         }
         if(relight && !laser_armed)
             gfio_wr_attr("cnc/laser_latch", "1");  /* disarmed meanwhile - relock */
+        pthread_mutex_unlock(&latch_mx);
     }
 }
 
@@ -649,7 +717,7 @@ bool gf_stream_suspend (void)
     if(!gf.active)
         return true;
 
-    bool idle;
+    bool idle, drop_hold = false;
 
     pthread_mutex_lock(&gf.lock);
     idle = !gf.streaming && !gf.kernel_running && gf.produced == gf.shipped;
@@ -663,7 +731,7 @@ bool gf_stream_suspend (void)
     }
     if(idle) {
         if(gf.hold_pending) {
-            gfio_currents_hold();
+            drop_hold = true;
             gf.hold_pending = false;
         }
         gf.suspended = true;
@@ -677,6 +745,9 @@ bool gf_stream_suspend (void)
         }
     }
     pthread_mutex_unlock(&gf.lock);
+
+    if(drop_hold)
+        gfio_currents_hold();   /* PIC-SPI: never under gf.lock */
 
     return idle;
 }
@@ -727,8 +798,9 @@ bool gf_stream_resume (void)
         }
     }
 
-    pthread_mutex_lock(&gf.lock);
-    gf.fd = fd;
+    /* All of the following runs outside gf.lock: gf.suspended keeps the
+     * shipper out until the final state swap, and rail_settle alone is
+     * seconds - a SCHED_FIFO thread must never wait on that. */
 
     /* Standalone, the exiting session dropped the 40 V rail moments ago
      * and our open bounced it back on; give the supply a real off
@@ -742,10 +814,12 @@ bool gf_stream_resume (void)
     char val[16];
     snprintf(val, sizeof(val), "%u", gf.rate);
     bool ok = gfio_wr_attr("cnc/step_freq", val) == 0;
-    lseek(gf.fd, 1, SEEK_SET);        /* clear pulse data + byte counters */
+    lseek(fd, 1, SEEK_SET);           /* clear pulse data + byte counters */
     gfio_wr_attr("cnc/stop", "1");    /* ack a stale underrun if latched */
     gfio_wr_attr("cnc/enable", "1");  /* steppers on (idle) */
 
+    pthread_mutex_lock(&gf.lock);
+    gf.fd = fd;
     gf.produced = gf.shipped = 0;
     gf.streaming = false;
     gf.kernel_running = false;
@@ -768,6 +842,17 @@ void gf_stream_init (void)
 {
     const char *dev = getenv("GFSINK"), *opt;
     char val[16];
+
+    /* gf.lock is contended by the SCHED_FIFO shipper against two
+     * normal-priority threads on a uniprocessor: priority inheritance
+     * bounds the inversion when a preempted holder blocks the shipper.
+     * Rebuilt here, before any user of the lock runs. */
+    pthread_mutexattr_t ma;
+    pthread_mutexattr_init(&ma);
+    pthread_mutexattr_setprotocol(&ma, PTHREAD_PRIO_INHERIT);
+    pthread_mutex_destroy(&gf.lock);
+    pthread_mutex_init(&gf.lock, &ma);
+    pthread_mutexattr_destroy(&ma);
 
     /* Hardware writes stay gated off for null-sink instances. */
     gfio_set_hw(dev != NULL && *dev != '\0');
