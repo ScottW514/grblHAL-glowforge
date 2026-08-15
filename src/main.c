@@ -61,7 +61,8 @@ static void print_usage (const char *badarg)
       "    GFSINK_DUMP      : mirror the shipped pulse stream to this file (debug).\n"
       "    GFHOME_CONF      : homing config file (default /data/forgefirm.conf).\n"
       "\n"
-      "  ^F (or SIGINT/SIGTERM) shuts down cleanly once motion is done.\n"
+      "  ^F shuts down cleanly once motion is done; SIGINT/SIGTERM stop motion\n"
+      "  (controlled deceleration, laser latch relocked) and then exit.\n"
       "\n",
       progname);
 }
@@ -84,11 +85,12 @@ static void print_version (void)
 static void sig_handler (int signum)
 {
     (void)signum;
+    // Stop now, then exit: motion in flight is brought to a controlled
+    // stop with the latch relocked before the process leaves. The handler
+    // stays installed so a repeated signal is a no-op rather than a hard
+    // kill mid-cleanup; the supervisor escalates to SIGKILL on its own
+    // deadline, and the kernel dead man's switch backstops that.
     driver_request_exit();
-    // A second signal falls through to the default action (hard kill; the
-    // kernel dead man's switch e-stops any running job).
-    signal(SIGINT, SIG_DFL);
-    signal(SIGTERM, SIG_DFL);
 }
 
 int main (int argc, char *argv[])

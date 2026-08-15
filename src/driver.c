@@ -53,6 +53,7 @@ static pthread_mutex_t core_mx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 static on_execute_realtime_ptr on_execute_realtime;
 static driver_reset_ptr driver_reset_chain;
 static _Atomic bool exit_requested = false;
+static bool exit_reset_sent = false;
 
 /* Deferred hal.delay_ms callback (fired from the realtime hook; the core
  * itself only ever uses the blocking form, plugins may not). */
@@ -298,8 +299,21 @@ static void glowforge_process_realtime (uint_fast16_t state)
     gflaser_poll();
     gfsw_poll();
 
-    if(exit_requested && state != STATE_CYCLE && state != STATE_JOG && state != STATE_HOMING)
-        exit(EXIT_SUCCESS);
+    if(exit_requested) {
+        if(state == STATE_CYCLE || state == STATE_JOG || state == STATE_HOMING) {
+            /* A termination request during motion is a stop, not a
+             * "finish the job": the same path as an incoming ^X -
+             * controlled deceleration, latch relocked, alarm - and the
+             * exit follows on the next pass. */
+            if(!exit_reset_sent) {
+                exit_reset_sent = true;
+                protocol_enqueue_realtime_command(CMD_RESET);
+            }
+        } else {
+            serial_poll();      /* flush the last reports (disarm, alarm) to the sender */
+            exit(EXIT_SUCCESS);
+        }
+    }
 
     /* serial_wait blocks on the serial fds, waking instantly on traffic,
      * so the idle tick can be coarse without adding input latency. A
