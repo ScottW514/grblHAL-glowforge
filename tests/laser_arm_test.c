@@ -24,6 +24,7 @@
   post-wait re-check.
 */
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -51,7 +52,7 @@ void gfcool_laser_armed(bool armed) { (void)armed; }
 void gf_stream_laser(unsigned char power, bool fire) { (void)power; (void)fire; }
 void gf_stream_laser_arm(bool armed) { stream_armed = armed; }
 void gf_stream_laser_latch(bool lock) { latch_locked_last = lock; }
-int  gfio_rd_attr(const char *a, char *b, unsigned long l)
+int  gfio_rd_attr(const char *a, char *b, size_t l)
 { (void)a; if (l) b[0] = '\0'; return -1; }
 float gfio_conf_read_float(const char *k, float fb) { (void)k; return fb; }
 void serial_poll(void) {}

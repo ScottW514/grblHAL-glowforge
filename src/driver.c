@@ -252,6 +252,29 @@ static void driverReset (void)
     driver_reset_chain();
 }
 
+/* True when the machine is parked waiting for the operator with motion
+ * fully stopped: a completed feed hold, a safety door (ajar or closed,
+ * awaiting cycle-start), or sleep. These carry the coarse idle pace -
+ * the resume command wakes the poll instantly, so there is nothing to
+ * gain from the tight segment-production pace. The motion sub-phases are
+ * excluded so they keep the tight pace: a decelerating hold
+ * (Hold_Pending) and a door retract or resume (Parking_Retracting /
+ * Parking_Resuming) still run segments. */
+static bool motion_parked (uint_fast16_t state)
+{
+    switch(state) {
+        case STATE_HOLD:
+            return sys.holding_state == Hold_Complete;
+        case STATE_SAFETY_DOOR:
+            return sys.parking_state == Parking_DoorClosed ||
+                   sys.parking_state == Parking_DoorAjar;
+        case STATE_SLEEP:
+            return true;
+        default:
+            return false;
+    }
+}
+
 /* Realtime hook, chained on grbl.on_execute_realtime: everything the
  * driver must do periodically on the protocol thread. Also paces the
  * loop - without a wait the protocol thread busy-spins and starves the
@@ -280,13 +303,15 @@ static void glowforge_process_realtime (uint_fast16_t state)
 
     /* serial_wait blocks on the serial fds, waking instantly on traffic,
      * so the idle tick can be coarse without adding input latency. A
-     * pending delay callback keeps a 1 ms tick for its deadline; motion
-     * states keep the tight pace for the stream feeder's sake. The wait
-     * comes BEFORE serial_poll so bytes that wake it are serviced now -
-     * the core then acts on them in the protocol pass that follows this
-     * hook (a '?' answers in the next pass, not after another tick). */
-    serial_wait(state == STATE_IDLE || state == STATE_ALARM
-                 ? (delay_callback ? 1000 : 10000) : 200);
+     * pending delay callback keeps a 1 ms tick for its deadline; states
+     * that are actively producing motion segments keep the tight pace
+     * for the stream feeder's sake, while idle, alarm and parked
+     * wait-for-operator states take the coarse pace. The wait comes
+     * BEFORE serial_poll so bytes that wake it are serviced now - the
+     * core then acts on them in the protocol pass that follows this hook
+     * (a '?' answers in the next pass, not after another tick). */
+    bool coarse = state == STATE_IDLE || state == STATE_ALARM || motion_parked(state);
+    serial_wait(coarse ? (delay_callback ? 1000 : 10000) : 200);
 
     serial_poll();
 
