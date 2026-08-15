@@ -41,10 +41,10 @@ AND-chain remains authoritative regardless.
 **Safety inputs** (`src/glowforge_switches.c`): the lid switches and the
 remote-interlock loop drive the core's safety-door signal, so opening the
 lid mid-job parks it in the door state and closing it resumes — matching
-what the hardware chain does to the beam. The e-stop bit is a sense line
-that rests active and drops during any stepper motion on this board, so it
-gates nothing unless `estop_halts_motion` is set in the machine settings
-(for machines retrofitted with a real e-stop circuit).
+what the hardware chain does to the beam. The `hv_enable` bit is the
+readback of the board's HV_ENABLE output (high only while a run feeds the
+charge-pump watchdog with the lid closed); it is telemetry and gates
+nothing.
 
 **Cooling** is enforced in-process but owned by the forgectrl cooling
 engine: the driver reports job state, gates fire and issues hold/resume

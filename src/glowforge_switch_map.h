@@ -19,7 +19,7 @@
 /* EV_SW bits per the device tree (see glowforge_switches.c for the
    semantics and the SERVICES.md switch map for the shared contract). */
 #define SW_BIT_DOORS      3
-#define SW_BIT_ESTOP      4
+#define SW_BIT_HV_ENABLE  4   /* readback of the HV_ENABLE output; monitoring only */
 #define SW_BIT_INTERLOCK  5
 
 #define SW_BYTES          2
@@ -35,18 +35,15 @@ static inline bool gfsw_bit_set (const uint8_t *sw, unsigned bit)
    - interlock (bit 5) is the remote-interlock loop with INVERTED
      sense, active = loop OPEN (lockout engaged) -> safety door ajar.
      Basic/Plus ship the connector jumpered, so the bit rests inactive.
-   - e-stop (bit 4) is a sense line resting ACTIVE on a healthy
-     machine; when gating is enabled, the assertion is the line
-     DROPPING. */
-static inline control_signals_t gfsw_map_bits (const uint8_t *sw,
-                                               bool estop_gates)
+   - hv_enable (bit 4) is the readback of the HV_ENABLE output and
+     gates nothing: it is low at idle and high only while a run feeds
+     the charge-pump watchdog with the lid closed. */
+static inline control_signals_t gfsw_map_bits (const uint8_t *sw)
 {
     control_signals_t signals = {0};
 
     signals.safety_door_ajar =
         !gfsw_bit_set(sw, SW_BIT_DOORS) || gfsw_bit_set(sw, SW_BIT_INTERLOCK);
-    if(estop_gates)
-        signals.e_stop = !gfsw_bit_set(sw, SW_BIT_ESTOP);
 
     return signals;
 }
@@ -61,7 +58,7 @@ static inline control_signals_t gfsw_map_bits (const uint8_t *sw,
    controller in Door until a cycle start. In a running or held job, a
    tool change, or an existing door state the signal is live, so a job
    started with the lid open parks on the first poll and a mid-job open
-   parks exactly as before. Everything else (e-stop) is always visible. */
+   parks exactly as before. */
 static inline control_signals_t gfsw_visible (control_signals_t now,
                                               sys_state_t state)
 {

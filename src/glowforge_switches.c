@@ -1,5 +1,5 @@
 /*
-  glowforge_switches.c - safety switch inputs (lid, interlock, e-stop sense)
+  glowforge_switches.c - safety switch inputs (lid, interlock)
 
   Part of grblHAL-glowforge
 
@@ -51,13 +51,11 @@
   and is delivered, the moment the core is in any other state, so a job
   started with the lid open parks on the first poll.
 
-  The e-stop bit (4) is a sense line whose resting state is ACTIVE on a healthy
-  machine, and on the factory board it drops for the duration of any stepper
-  motion and recovers at idle. Wiring it to the core's e_stop signal would
-  therefore abort every job on this hardware, so it is opt-in through the
-  shared machine settings and off by default - the same escape hatch the cloud
-  client exposes as MOTION.ESTOP_HALTS_MOTION. When enabled, the assertion is
-  the line dropping.
+  Bit 4 (hv_enable) is the readback of the board's HV_ENABLE output, not an
+  input: it is low at idle and high only while a run feeds the charge-pump
+  watchdog with the lid closed. It is telemetry (forgectrl shows it) and gates
+  nothing here; the core's e_stop signal is not wired to anything on this
+  hardware.
 
   Bit 6 (interlock latch tripped) is deliberately not gated on: its resting
   state on a healthy machine is not characterized, and a false assertion would
@@ -66,7 +64,6 @@
 
 #include "glowforge_switches.h"
 #include "glowforge_switch_map.h"
-#include "glowforge_io.h"
 
 #include "grbl/state_machine.h"
 
@@ -80,7 +77,6 @@
 #define SWITCH_DEV        "/dev/input/event0"
 
 static int sw_fd = -1;
-static bool estop_gates_motion = false;
 static control_signals_t state = {0};      /* raw reading of the switch device */
 static control_signals_t delivered = {0};  /* asserted signals the core has been told about */
 
@@ -95,7 +91,7 @@ static bool read_signals (control_signals_t *signals)
     if(sw_fd < 0 || ioctl(sw_fd, EVIOCGSW(sizeof(sw)), sw) < 0)
         return false;
 
-    *signals = gfsw_map_bits(sw, estop_gates_motion);
+    *signals = gfsw_map_bits(sw);
 
     return true;
 }
@@ -104,26 +100,22 @@ void gfsw_init (void)
 {
     control_signals_t initial = {0};
 
-    /* Conf key mirrors the cloud client's MOTION.ESTOP_HALTS_MOTION. */
-    estop_gates_motion = gfio_conf_read_float("estop_halts_motion", 0.0f) != 0.0f;
+    /* Nothing on this hardware is an e-stop input. */
+    hal.signals_cap.e_stop = Off;
 
     if((sw_fd = open(SWITCH_DEV, O_RDONLY | O_CLOEXEC)) < 0) {
         /* Null-sink/host builds have no switch device: nothing to gate on. */
         hal.signals_cap.safety_door_ajar = Off;
-        hal.signals_cap.e_stop = Off;
         return;
     }
 
     hal.signals_cap.safety_door_ajar = On;
-    hal.signals_cap.e_stop = estop_gates_motion;
 
     if(read_signals(&initial))
         state = initial;
 
     if(state.safety_door_ajar)
         fprintf(stderr, "gfswitch: lid open or interlock loop open at startup\n");
-    if(estop_gates_motion)
-        fprintf(stderr, "gfswitch: e-stop sense gates motion (estop_halts_motion)\n");
 }
 
 control_signals_t gfsw_get_state (void)

@@ -10,8 +10,8 @@
     - interlock (bit 5) is INVERTED: active = loop OPEN (lockout);
       a flip here would read a Pro's remote interlock as satisfied
       while it is open
-    - e-stop (bit 4) rests ACTIVE on a healthy machine; the assertion
-      is the line dropping, and only when gating is enabled
+    - hv_enable (bit 4) is the readback of the HV_ENABLE output and
+      never gates: neither state asserts anything
 
   Also covers the visibility policy (gfsw_visible / gfsw_edges): the
   door signal is hidden from the core while IDLE, JOG or HOMING and
@@ -38,11 +38,11 @@ static void expect (const char *name, bool got, bool want)
     }
 }
 
-static uint8_t *mask (bool doors, bool estop, bool interlock)
+static uint8_t *mask (bool doors, bool hv_enable, bool interlock)
 {
     static uint8_t sw[SW_BYTES];
     sw[0] = (uint8_t)((doors ? 1u << SW_BIT_DOORS : 0)
-                    | (estop ? 1u << SW_BIT_ESTOP : 0)
+                    | (hv_enable ? 1u << SW_BIT_HV_ENABLE : 0)
                     | (interlock ? 1u << SW_BIT_INTERLOCK : 0));
     sw[1] = 0;
     return sw;
@@ -52,50 +52,45 @@ int main (void)
 {
     control_signals_t s;
 
-    /* Healthy machine: lid closed, e-stop sense resting active,
+    /* Healthy idle machine: lid closed, HV_ENABLE readback low,
        interlock loop closed (bit inactive). Nothing gates. */
-    s = gfsw_map_bits(mask(true, true, false), false);
+    s = gfsw_map_bits(mask(true, false, false));
     expect("healthy machine gates nothing", s.bits != 0, false);
 
     /* Lid open -> safety door ajar. */
-    s = gfsw_map_bits(mask(false, true, false), false);
+    s = gfsw_map_bits(mask(false, false, false));
     expect("open lid is a door event", s.safety_door_ajar, true);
 
     /* Remote interlock loop OPEN = bit ACTIVE (inverted sense) ->
        safety door ajar. THE polarity this test exists for. */
-    s = gfsw_map_bits(mask(true, true, true), false);
+    s = gfsw_map_bits(mask(true, false, true));
     expect("open interlock loop is a door event", s.safety_door_ajar, true);
 
     /* Interlock loop closed (jumpered Basic/Plus) with the lid closed
        must NOT read as a door event. */
-    s = gfsw_map_bits(mask(true, true, false), false);
+    s = gfsw_map_bits(mask(true, false, false));
     expect("closed interlock loop is not a door event",
            s.safety_door_ajar, false);
 
     /* Both open: still (only) a door event. */
-    s = gfsw_map_bits(mask(false, true, true), false);
+    s = gfsw_map_bits(mask(false, false, true));
     expect("lid + interlock both open is a door event",
            s.safety_door_ajar, true);
 
-    /* E-stop gating disabled (the default): a dropped sense line does
-       not assert e_stop (the factory board drops it during any motion). */
-    s = gfsw_map_bits(mask(true, false, false), false);
-    expect("dropped e-stop sense ignored when gating is off",
-           s.e_stop, false);
-
-    /* E-stop gating enabled: the assertion is the line DROPPING... */
-    s = gfsw_map_bits(mask(true, false, false), true);
-    expect("dropped e-stop sense asserts when gating is on", s.e_stop, true);
-
-    /* ...and the resting-active line is not an assertion. */
-    s = gfsw_map_bits(mask(true, true, false), true);
-    expect("resting e-stop sense does not assert", s.e_stop, false);
+    /* The HV_ENABLE readback (bit 4) is telemetry: high (a run in
+       progress) or low (idle) asserts nothing, in particular not e_stop. */
+    s = gfsw_map_bits(mask(true, true, false));
+    expect("hv_enable high gates nothing", s.bits != 0, false);
+    s = gfsw_map_bits(mask(true, false, false));
+    expect("hv_enable low gates nothing", s.bits != 0, false);
+    s = gfsw_map_bits(mask(false, true, false));
+    expect("open lid with hv_enable high is only a door event",
+           s.safety_door_ajar && !s.e_stop, true);
 
     /* ---- visibility policy: what the core sees, by its state ---- */
 
-    control_signals_t open_lid = gfsw_map_bits(mask(false, true, false), false);
-    control_signals_t open_loop = gfsw_map_bits(mask(true, true, true), false);
-    control_signals_t estop_on = gfsw_map_bits(mask(true, false, false), true);
+    control_signals_t open_lid = gfsw_map_bits(mask(false, false, false));
+    control_signals_t open_loop = gfsw_map_bits(mask(true, false, true));
 
     /* Idle, jog and homing: an open lid or loop is hidden (the beam is
        blocked in hardware; a door seen here strands the core in Door). */
@@ -111,14 +106,10 @@ int main (void)
     expect("open lid visible in TOOL_CHANGE", gfsw_visible(open_lid, STATE_TOOL_CHANGE).safety_door_ajar, true);
     expect("open loop visible in CYCLE", gfsw_visible(open_loop, STATE_CYCLE).safety_door_ajar, true);
 
-    /* E-stop is never hidden. */
-    expect("e-stop visible while IDLE", gfsw_visible(estop_on, STATE_IDLE).e_stop, true);
-    expect("e-stop visible in CYCLE", gfsw_visible(estop_on, STATE_CYCLE).e_stop, true);
-
     /* ---- delivery sequence: the load-material lid cycle, then a job ---- */
 
     control_signals_t told = {0}, on, off, want;
-    control_signals_t closed = gfsw_map_bits(mask(true, true, false), false);
+    control_signals_t closed = gfsw_map_bits(mask(true, false, false));
 
     /* Lid opened and closed at idle: nothing is delivered either way. */
     want = gfsw_visible(open_lid, STATE_IDLE);

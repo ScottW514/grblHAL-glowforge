@@ -1,5 +1,5 @@
 /*
-  glowforge_switches.h - safety switch inputs (lid, interlock, e-stop sense)
+  glowforge_switches.h - safety switch inputs (lid, interlock)
 
   Part of grblHAL-glowforge
 
