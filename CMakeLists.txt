@@ -61,7 +61,8 @@ add_executable(grblHAL_glowforge ${DRIVER_SOURCES})
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     # The DRIVER's own sources are warning-free and held to that; the
     # core submodule is upstream code and is not held to -Werror here.
-    set_source_files_properties(${DRIVER_SOURCES} tests/switch_map_test.c
+    set_source_files_properties(${DRIVER_SOURCES}
+        tests/switch_map_test.c tests/laser_arm_test.c
         PROPERTIES COMPILE_OPTIONS "-Werror")
 endif()
 
@@ -84,3 +85,11 @@ add_executable(switch_map_test tests/switch_map_test.c)
 # Headers only - the test exercises the pure mapping and must not link
 # the core (whose entry points expect the full driver).
 target_include_directories(switch_map_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
+
+# Host unit test for the operator-arm coolant re-check (G-4): the arm
+# must re-check gfcool_fire_ok() after the button wait. It includes the
+# driver source directly and stubs the core, so - like switch_map_test -
+# it must not link the core. Built everywhere, installed nowhere.
+add_executable(laser_arm_test tests/laser_arm_test.c)
+target_include_directories(laser_arm_test PRIVATE src ${CMAKE_CURRENT_BINARY_DIR})
+target_link_libraries(laser_arm_test m)
