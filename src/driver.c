@@ -42,6 +42,7 @@
 #include "glowforge_switches.h"
 #include "eeprom.h"
 #include "grbl_eeprom_extensions.h"
+#include "fflog.h"
 
 #include "grbl/hal.h"
 #include "grbl/protocol.h"
@@ -289,7 +290,7 @@ static void glowforge_process_realtime (uint_fast16_t state)
     }
 
     if(gf_stream_fault_take()) {
-        fprintf(stderr, "gfstream: stream fault - raising alarm, re-home required\n");
+        fflog(LOG_ERR, "gfstream: stream fault - raising alarm, re-home required");
         gflaser_disarm();
         gfhome_invalidate();
         system_raise_alarm(Alarm_MotorFault);

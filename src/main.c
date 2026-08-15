@@ -27,6 +27,8 @@
 
 #include "grbl/grbllib.h"
 
+#include "fflog.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -60,6 +62,9 @@ static void print_usage (const char *badarg)
       "    GFSINK_DEPTH_MS  : stream queue depth = feed-hold latency (default 200).\n"
       "    GFSINK_DUMP      : mirror the shipped pulse stream to this file (debug).\n"
       "    GFHOME_CONF      : homing config file (default /data/forgefirm.conf).\n"
+      "    FFLOG_LEVEL      : log level override (off|error|warning|notice|info|debug);\n"
+      "                       default from /data/forgefirm.conf (log_grblhal_*).\n"
+      "    FFLOG_STDERR     : 1 = echo log lines to stderr (automatic on a terminal).\n"
       "\n"
       "  ^F shuts down cleanly once motion is done; SIGINT/SIGTERM stop motion\n"
       "  (controlled deceleration, laser latch relocked) and then exit.\n"
@@ -99,6 +104,9 @@ int main (int argc, char *argv[])
     int listen_fd = -1;
 
     progname = argv[0];
+    // Log through syslog under this program name (levels from the shared
+    // machine config; echoed to a terminal or with FFLOG_STDERR=1).
+    fflog_init("grblhal");
     set_eeprom_name("EEPROM.DAT");
 
     while(argc > 1) {
@@ -155,8 +163,8 @@ int main (int argc, char *argv[])
     // limit and thread creation fails outright - strictly worse than
     // running unlocked.
     if(geteuid() == 0 && mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
-        fprintf(stderr, "mlockall unavailable: %s (running unlocked)\n",
-                strerror(errno));
+        fflog(LOG_ERR, "mlockall unavailable: %s (running unlocked)",
+              strerror(errno));
 
     platform_init();
 

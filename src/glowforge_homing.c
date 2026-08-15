@@ -40,6 +40,7 @@
 
 /* grbl headers first: glibc's stat.h (via fcntl.h) defines an st_mtime
  * macro that would otherwise mangle the field of that name in vfs.h */
+#include "fflog.h"
 #include "driver.h"
 #include "glowforge_homing.h"
 #include "glowforge_io.h"
@@ -133,7 +134,7 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
         return sys.abort ? Status_OK : Status_IdleError;
     }
 
-    fprintf(stderr, "gfhome: starting homing session: %s\n", cmd);
+    fflog(LOG_INFO, "gfhome: starting homing session: %s", cmd);
 
     /* Hand the runner its share of the budget so it gives up before the
      * SIGTERM deadline. Set pre-fork (env calls are not async-signal-
@@ -151,7 +152,7 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
     }
     unsetenv("GFHOME_TIMEOUT_S");
     if(pid < 0) {
-        fprintf(stderr, "gfhome: cannot spawn the homing runner\n");
+        fflog(LOG_ERR, "gfhome: cannot spawn the homing runner");
         if(!gf_stream_resume())
             system_set_exec_alarm(Alarm_HomingFail);
         state_set(entry_state);
@@ -172,12 +173,12 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
         else {
             if(!pump(50000) && !aborted) {
                 aborted = true;
-                fprintf(stderr, "gfhome: abort - terminating the homing session\n");
+                fflog(LOG_WARNING, "gfhome: abort - terminating the homing session");
             }
             bool overdue = (int32_t)(hal.get_elapsed_ticks() - deadline) > 0;
             if((aborted || overdue) && !term_sent) {
                 if(overdue)
-                    fprintf(stderr, "gfhome: homing session timed out\n");
+                    fflog(LOG_WARNING, "gfhome: homing session timed out");
                 kill(-pid, SIGTERM);
                 term_sent = true;
                 kill_at = hal.get_elapsed_ticks() + KILL_GRACE_MS;
@@ -196,8 +197,8 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
 
     if(!resumed || !homed) {
         if(exited && !aborted && !term_sent && !homed)
-            fprintf(stderr, "gfhome: homing runner failed (status %d)\n",
-                    WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1);
+            fflog(LOG_ERR, "gfhome: homing runner failed (status %d)",
+                  WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1);
         /* Same shape as a failed core homing cycle: back to idle with
          * the alarm queued - the protocol loop broadcasts ALARM and
          * enters the alarm state. On a clean abort the reset path owns
@@ -242,8 +243,8 @@ static status_code_t gfcloud_home (sys_state_t entry_state)
     st_go_idle();
     grbl.report.feedback_message(Message_None);
 
-    fprintf(stderr, "gfhome: homed - X%.2f Y%.2f Z%.2f\n",
-            home[X_AXIS], home[Y_AXIS], home[Z_AXIS]);
+    fflog(LOG_NOTICE, "gfhome: homed - X%.2f Y%.2f Z%.2f",
+          home[X_AXIS], home[Y_AXIS], home[Z_AXIS]);
 
     return Status_OK;
 }

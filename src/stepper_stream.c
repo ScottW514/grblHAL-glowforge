@@ -75,6 +75,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "fflog.h"
 #include "stepper_stream.h"
 #include "glowforge_homing.h"
 #include "glowforge_io.h"
@@ -538,12 +539,12 @@ static void *producer_thread (void *arg)
             pthread_mutex_lock(&gf.lock);
             uint64_t clamped_run = gf.clamped - clamped0;
             pthread_mutex_unlock(&gf.lock);
-            fprintf(stderr, "gfstream: run: %llu callbacks in %.3f s (%.1f us/call incl. pacing), "
-                    "%llu pace sleeps, max behind %.1f ms, clamped %llu\n",
-                    (unsigned long long)n_calls, wall_s() - t_run,
-                    (wall_s() - t_run) * 1e6 / (double)n_calls,
-                    (unsigned long long)slept, max_behind * 1e3,
-                    (unsigned long long)clamped_run);
+            fflog(LOG_DEBUG, "gfstream: run: %llu callbacks in %.3f s (%.1f us/call incl. pacing), "
+                  "%llu pace sleeps, max behind %.1f ms, clamped %llu",
+                  (unsigned long long)n_calls, wall_s() - t_run,
+                  (wall_s() - t_run) * 1e6 / (double)n_calls,
+                  (unsigned long long)slept, max_behind * 1e3,
+                  (unsigned long long)clamped_run);
         }
     }
 
@@ -872,7 +873,7 @@ static void rail_settle (void)
     if(s <= 0.0f)
         return;
     gfio_wr_attr("cnc/disable", "1");
-    fprintf(stderr, "gfstream: settling motor rail for %.1f s\n", s);
+    fflog(LOG_INFO, "gfstream: settling motor rail for %.1f s", s);
     for(double end = wall_s() + (double)s; wall_s() < end; )
         sleep_ns(50000000);
 }
@@ -898,7 +899,7 @@ bool gf_stream_resume (void)
                 sleep_ns(100000000);   /* 100 ms */
         }
         if(fd < 0) {
-            fprintf(stderr, "gfstream: cannot reacquire %s\n", gf.dev);
+            fflog(LOG_ERR, "gfstream: cannot reacquire %s", gf.dev);
             return false;
         }
     }
@@ -938,7 +939,7 @@ bool gf_stream_resume (void)
     pthread_mutex_unlock(&gf.lock);
 
     if(!ok)
-        fprintf(stderr, "gfstream: cannot restore step_freq\n");
+        fflog(LOG_ERR, "gfstream: cannot restore step_freq");
 
     return ok;
 }
@@ -973,8 +974,8 @@ void gf_stream_init (void)
         if(v >= GFSINK_RATE_MIN && v <= GFSINK_RATE_MAX)
             gf.rate = (uint32_t)v;
         else
-            fprintf(stderr, "gfstream: GFSINK_RATE '%s' out of range (%u-%u); using %u\n",
-                    opt, GFSINK_RATE_MIN, GFSINK_RATE_MAX, GFSINK_RATE_DEFAULT);
+            fflog(LOG_WARNING, "gfstream: GFSINK_RATE '%s' out of range (%u-%u); using %u",
+                  opt, GFSINK_RATE_MIN, GFSINK_RATE_MAX, GFSINK_RATE_DEFAULT);
     }
     uint32_t depth_ms = GFSINK_DEPTH_MS_DEFAULT;
     if((opt = getenv("GFSINK_DEPTH_MS")) && *opt) {
@@ -982,8 +983,8 @@ void gf_stream_init (void)
         if(v >= GFSINK_DEPTH_MS_MIN && (uint64_t)gf.rate * (uint64_t)v / 1000 <= RING_SIZE / 2)
             depth_ms = (uint32_t)v;
         else
-            fprintf(stderr, "gfstream: GFSINK_DEPTH_MS '%s' out of range at %u Hz; using %u\n",
-                    opt, gf.rate, GFSINK_DEPTH_MS_DEFAULT);
+            fflog(LOG_WARNING, "gfstream: GFSINK_DEPTH_MS '%s' out of range at %u Hz; using %u",
+                  opt, gf.rate, GFSINK_DEPTH_MS_DEFAULT);
     }
     gf.depth = (uint32_t)((uint64_t)gf.rate * depth_ms / 1000);
 
@@ -996,7 +997,7 @@ void gf_stream_init (void)
 
         gf.dev = dev;
         if((gf.fd = gfio_open_pulse_dev(dev)) < 0) {
-            fprintf(stderr, "gfstream: cannot open %s\n", dev);
+            fflog(LOG_ERR, "gfstream: cannot open %s", dev);
             exit(1);
         }
 
@@ -1007,7 +1008,7 @@ void gf_stream_init (void)
         if(!gfio_pulse_inherited())
             rail_settle();
         else
-            fprintf(stderr, "gfstream: pulse device inherited from the broker\n");
+            fflog(LOG_INFO, "gfstream: pulse device inherited from the broker");
 
         /* Laser latch locked at init (glowforge_laser.c unlocks it only
          * inside an operator-armed job window); then the full factory
@@ -1015,7 +1016,7 @@ void gf_stream_init (void)
         gfio_analog_config();
         snprintf(val, sizeof(val), "%u", gf.rate);
         if(gfio_wr_attr("cnc/step_freq", val) != 0) {
-            fprintf(stderr, "gfstream: cannot set step_freq\n");
+            fflog(LOG_ERR, "gfstream: cannot set step_freq");
             exit(1);
         }
         /* Fresh stream state. */
@@ -1028,14 +1029,14 @@ void gf_stream_init (void)
 
     if(pthread_create(&gf.producer_tid, NULL, producer_thread, NULL) != 0 ||
         pthread_create(&gf.shipper_tid, NULL, shipper_thread, NULL) != 0) {
-        fprintf(stderr, "gfstream: cannot start stream threads\n");
+        fflog(LOG_ERR, "gfstream: cannot start stream threads");
         exit(1);
     }
     gf.threads_started = true;
 
     atexit(gf_stream_shutdown);
-    fprintf(stderr, "gfstream: %s, %u Hz machine tick, %u ms depth\n",
-            gf.active ? dev : "null-sink (no GFSINK)", gf.rate, depth_ms);
+    fflog(LOG_INFO, "gfstream: %s, %u Hz machine tick, %u ms depth",
+          gf.active ? dev : "null-sink (no GFSINK)", gf.rate, depth_ms);
 }
 
 void gf_stream_shutdown (void)
@@ -1064,8 +1065,8 @@ void gf_stream_shutdown (void)
     if(gf.active)
         gfio_wr_attr("cnc/laser_latch", "1");
     if(gf.clamped)
-        fprintf(stderr, "gfstream: %llu late events clamped\n",
-                (unsigned long long)gf.clamped);
+        fflog(LOG_WARNING, "gfstream: %llu late events clamped",
+              (unsigned long long)gf.clamped);
     if(gf.fd >= 0) {
         close(gf.fd);
         gf.fd = -1;

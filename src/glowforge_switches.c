@@ -62,6 +62,7 @@
   wedge every job. The hardware chain enforces it regardless.
 */
 
+#include "fflog.h"
 #include "glowforge_switches.h"
 #include "glowforge_switch_map.h"
 
@@ -115,7 +116,7 @@ void gfsw_init (void)
         state = initial;
 
     if(state.safety_door_ajar)
-        fprintf(stderr, "gfswitch: lid open or interlock loop open at startup\n");
+        fflog(LOG_WARNING, "gfswitch: lid open or interlock loop open at startup");
 }
 
 control_signals_t gfsw_get_state (void)

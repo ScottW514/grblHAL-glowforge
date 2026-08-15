@@ -60,6 +60,7 @@ set(DRIVER_SOURCES
     src/eeprom.c
     src/grbl_eeprom_extensions.c
     src/platform_linux.c
+    src/fflog.c
 )
 
 add_executable(grblHAL_glowforge ${DRIVER_SOURCES})

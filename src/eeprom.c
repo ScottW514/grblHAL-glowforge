@@ -25,6 +25,8 @@
   SPDX-License-Identifier: GPL-3.0-or-later
 */
 
+#include "fflog.h"
+
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -78,9 +80,9 @@ static FILE *eeprom_fp (void)
             EEPROM_FP = eeprom_create_empty_file();
         }
         if (!EEPROM_FP) {
-            fprintf(stderr, "eeprom: cannot open or create %s: %s - "
-                            "settings are volatile for this run\n",
-                    eeprom_file, strerror(errno));
+            fflog(LOG_ERR, "eeprom: cannot open or create %s: %s - "
+                           "settings are volatile for this run",
+                  eeprom_file, strerror(errno));
             memset(eeprom_ram, 0xFF, sizeof(eeprom_ram));
             eeprom_volatile = true;
         }

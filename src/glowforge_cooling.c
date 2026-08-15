@@ -52,6 +52,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "fflog.h"
 #include "glowforge_cooling.h"
 #include "glowforge_io.h"
 
@@ -122,7 +123,7 @@ static uint32_t mono_ms (void)
 static void warn (const char *msg)
 {
     report_message(msg, Message_Warning);
-    fprintf(stderr, "gfcool: %s\n", msg);
+    fflog(LOG_WARNING, "gfcool: %s", msg);
 }
 
 /* ------------------------------------------------------- job reports */
@@ -361,7 +362,7 @@ void gfcool_init (void)
     pthread_attr_init(&a);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     if(pthread_create(&tid, &a, reporter_thread, NULL) != 0)
-        fprintf(stderr, "gfcool: cannot start the reporter thread\n");
+        fflog(LOG_ERR, "gfcool: cannot start the reporter thread");
     pthread_attr_destroy(&a);
 }
 
@@ -440,7 +441,7 @@ void gfcool_poll (void)
                 stale_warned = false;
                 fallback_done = false;
                 report_message("cooling service restored", Message_Info);
-                fprintf(stderr, "gfcool: cooling service restored\n");
+                fflog(LOG_INFO, "gfcool: cooling service restored");
             }
 
             /* Relay the engine's reason to the sender once per change. */
@@ -469,7 +470,7 @@ void gfcool_poll (void)
                         hold_ours = false;
                         report_message("cooling verdict clean - resuming",
                                        Message_Info);
-                        fprintf(stderr, "gfcool: resuming\n");
+                        fflog(LOG_INFO, "gfcool: resuming");
                         protocol_enqueue_realtime_command(CMD_CYCLE_START);
                     }
                 }
