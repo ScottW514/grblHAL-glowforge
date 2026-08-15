@@ -77,7 +77,9 @@ GFSINK=/dev/glowforge grblHAL_glowforge -p 23 -e /data/EEPROM.DAT
 
 Environment: `GFSINK` (pulse device; unset = null-sink test mode),
 `GFSINK_RATE` (machine tick, default 28160 Hz — the factory's own
-travel-move tick), `GFSINK_DEPTH_MS` (queue depth, default 200).
+travel-move tick; accepted 1000–165000), `GFSINK_DEPTH_MS` (queue depth,
+default 200; at least 20 and no more than half the stream ring at the
+chosen rate). An out-of-range value is reported and the default is used.
 
 ## Lineage & license
 

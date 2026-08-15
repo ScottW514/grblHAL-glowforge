@@ -110,6 +110,16 @@
 /* Shipper cadence. */
 #define SHIP_PERIOD_NS 10000000 /* 10 ms */
 
+/* GFSINK_RATE / GFSINK_DEPTH_MS bounds. The rate ceiling is the kernel
+ * script's effective per-byte playback limit (~165 kHz); the depth floor
+ * keeps at least one ship chunk in flight per shipper period, and the
+ * ceiling (RING_SIZE / 2 bytes at the chosen rate) is applied at init. */
+#define GFSINK_RATE_DEFAULT 28160
+#define GFSINK_RATE_MIN 1000
+#define GFSINK_RATE_MAX 165000
+#define GFSINK_DEPTH_MS_DEFAULT 200
+#define GFSINK_DEPTH_MS_MIN 20
+
 /* Laser transition queue: must cover the transitions in flight between
  * the producer and the shipped cursor (~preload depth of stream time).
  * Grayscale engraving is the heavy case - a power change per pixel can
@@ -211,6 +221,59 @@ static void sleep_ns (long ns)
     nanosleep(&ts, NULL);
 }
 
+/* Logging from the SCHED_FIFO shipper, or from under gf.lock: a raw
+ * write(2) to stderr instead of stdio, so a real-time thread never
+ * queues on the stdio FILE lock behind a normal-priority thread that is
+ * mid-write to slow storage. */
+static void rt_log (const char *msg)
+{
+    size_t len = strlen(msg);
+    while(len) {
+        ssize_t w = write(STDERR_FILENO, msg, len);
+        if(w < 0 && errno == EINTR)
+            continue;
+        if(w <= 0)
+            break;
+        msg += w;
+        len -= (size_t)w;
+    }
+}
+
+/* Pulse-device write with the UAPI's backpressure semantics: -ENOMEM
+ * (ring full) is "back off", not failure - retried on a short sleep for
+ * a bounded time; EINTR is retried; a partial write is completed. The
+ * bound is generous because the wall-clock pacing keeps the queue
+ * shallow, so a ring that stays full is a kernel that has stopped
+ * consuming and is caught by check_kernel_state(). Returns 0 or -1 with
+ * errno set. */
+#define PULSE_WRITE_BACKOFF_NS 2000000L   /* 2 ms */
+#define PULSE_WRITE_BACKOFF_MAX 250       /* ~0.5 s of ring-full retries */
+
+static int pulse_write (int fd, const unsigned char *buf, size_t len)
+{
+    int backoffs = 0;
+
+    while(len) {
+        ssize_t w = write(fd, buf, len);
+        if(w > 0) {
+            buf += w;
+            len -= (size_t)w;
+            continue;
+        }
+        if(w < 0 && errno == EINTR)
+            continue;
+        if(w < 0 && (errno == ENOMEM || errno == EAGAIN) &&
+            ++backoffs <= PULSE_WRITE_BACKOFF_MAX) {
+            sleep_ns(PULSE_WRITE_BACKOFF_NS);
+            continue;
+        }
+        if(w == 0)
+            errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
 uint32_t gf_stream_vclk (void)
 {
     return gf.rate * VTICKS_PER_BYTE;
@@ -257,7 +320,7 @@ void gf_stream_pulse (uint8_t step_bits, uint8_t dir_bits)
         if(idx < gf.produced)           /* same machine tick as a previous event */
             idx = gf.produced;
         if(idx - gf.shipped >= RING_SIZE - 1) {
-            fprintf(stderr, "gfstream: ring overflow (producer runaway)\n");
+            rt_log("gfstream: ring overflow (producer runaway)\n");
             gf.failed = true;
             fault_flag = true;
         } else {
@@ -303,7 +366,7 @@ void gf_stream_laser (uint8_t power, bool fire)
             e->fire = fire;
             if(!gf.lev_overflow_warned) {
                 gf.lev_overflow_warned = true;
-                fprintf(stderr, "gfstream: laser transition queue overflow (merging)\n");
+                rt_log("gfstream: laser transition queue overflow (merging)\n");
             }
         } else {
             gf.lev[gf.lev_tail & LEV_MASK] =
@@ -601,8 +664,11 @@ static void ship_pass (void)
         if(n == 0)
             break;
         if(gf.dump_fd >= 0 && write(gf.dump_fd, chunk, n) < 0) { /* debug copy only */ }
-        if(gf.active && write(gf.fd, chunk, n) < 0) {
-            fprintf(stderr, "gfstream: pulse write failed: %s\n", strerror(errno));
+        if(gf.active && pulse_write(gf.fd, chunk, n) < 0) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "gfstream: pulse write failed: %s\n",
+                     strerror(errno));
+            rt_log(msg);
             gf.failed = true;
             fault_flag = true;
             break;
@@ -634,8 +700,8 @@ static void ship_pass (void)
                 /* Late detection of a starve: ack, then retry once. The
                  * counters no longer prove position, so the homing
                  * anchor must not survive the retry. */
-                fprintf(stderr, "gfstream: kernel underrun; recovering - "
-                                "position untrusted, re-home before an armed job\n");
+                rt_log("gfstream: kernel underrun; recovering - "
+                       "position untrusted, re-home before an armed job\n");
                 gfhome_invalidate();
                 gfio_wr_attr("cnc/stop", "1");
                 gfio_wr_attr("cnc/run", "1");
@@ -644,12 +710,14 @@ static void ship_pass (void)
                  * so replaying the queued bytes could fire remaining
                  * fire bits at ~full power. Ack the underrun and fail
                  * safe instead; the alarm path relocks the latch. */
-                fprintf(stderr, "gfstream: kernel underrun while laser armed - failing safe\n");
+                rt_log("gfstream: kernel underrun while laser armed - failing safe\n");
                 gfio_wr_attr("cnc/stop", "1");
                 gf.failed = true;
                 fault_flag = true;
             } else if(strcmp(state, "running") != 0) {
-                fprintf(stderr, "gfstream: run refused (state=%s)\n", state);
+                char msg[64];
+                snprintf(msg, sizeof(msg), "gfstream: run refused (state=%s)\n", state);
+                rt_log(msg);
                 gf.failed = true;
                 fault_flag = true;
             }
@@ -681,7 +749,9 @@ static void check_kernel_state (void)
     if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0)
         return;
     if(strcmp(state, "underrun") == 0 || strcmp(state, "fault") == 0) {
-        fprintf(stderr, "gfstream: kernel %s mid-run - alarming\n", state);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "gfstream: kernel %s mid-run - alarming\n", state);
+        rt_log(msg);
         pthread_mutex_lock(&gf.lock);
         gf.failed = true;
         pthread_mutex_unlock(&gf.lock);
@@ -697,7 +767,7 @@ static void *shipper_thread (void *arg)
      * silently to normal scheduling without privileges. */
     struct sched_param sp = { .sched_priority = 10 };
     if(pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
-        fprintf(stderr, "gfstream: SCHED_FIFO unavailable, using default scheduling\n");
+        rt_log("gfstream: SCHED_FIFO unavailable, using default scheduling\n");
 
     while(!quit) {
         ship_pass();
@@ -892,8 +962,29 @@ void gf_stream_init (void)
     /* Hardware writes stay gated off for null-sink instances. */
     gfio_set_hw(dev != NULL && *dev != '\0');
 
-    gf.rate = (opt = getenv("GFSINK_RATE")) ? (uint32_t)atoi(opt) : 28160;
-    uint32_t depth_ms = (opt = getenv("GFSINK_DEPTH_MS")) ? (uint32_t)atoi(opt) : 200;
+    /* Machine tick and queue depth. Out-of-range values fall back to the
+     * defaults with a warning rather than being applied: a zero rate is
+     * a division by zero in the pacing math, a rate above the kernel's
+     * effective playback ceiling underruns by construction, and a depth
+     * the stream ring cannot hold faults on the first ship. */
+    gf.rate = GFSINK_RATE_DEFAULT;
+    if((opt = getenv("GFSINK_RATE")) && *opt) {
+        long v = strtol(opt, NULL, 10);
+        if(v >= GFSINK_RATE_MIN && v <= GFSINK_RATE_MAX)
+            gf.rate = (uint32_t)v;
+        else
+            fprintf(stderr, "gfstream: GFSINK_RATE '%s' out of range (%u-%u); using %u\n",
+                    opt, GFSINK_RATE_MIN, GFSINK_RATE_MAX, GFSINK_RATE_DEFAULT);
+    }
+    uint32_t depth_ms = GFSINK_DEPTH_MS_DEFAULT;
+    if((opt = getenv("GFSINK_DEPTH_MS")) && *opt) {
+        long v = strtol(opt, NULL, 10);
+        if(v >= GFSINK_DEPTH_MS_MIN && (uint64_t)gf.rate * (uint64_t)v / 1000 <= RING_SIZE / 2)
+            depth_ms = (uint32_t)v;
+        else
+            fprintf(stderr, "gfstream: GFSINK_DEPTH_MS '%s' out of range at %u Hz; using %u\n",
+                    opt, gf.rate, GFSINK_DEPTH_MS_DEFAULT);
+    }
     gf.depth = (uint32_t)((uint64_t)gf.rate * depth_ms / 1000);
 
     /* Bench/debug: mirror every shipped byte to a file for offline

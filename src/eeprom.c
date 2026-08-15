@@ -21,20 +21,26 @@
 
   You should have received a copy of the GNU General Public License
   along with Grbl.  If not, see <http://www.gnu.org/licenses/>.
+
+  SPDX-License-Identifier: GPL-3.0-or-later
 */
 
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
+#include <errno.h>
 
 #define MAX_EEPROM_SIZE 4096   // 4KB EEPROM
 
 static char eeprom_file[128];
 
-void set_eeprom_name (char *name)
+bool set_eeprom_name (const char *name)
 {
+    if (!name || strlen(name) >= sizeof(eeprom_file))
+        return false;
     strcpy(eeprom_file, name);
+    return true;
 }
 
 static FILE *eeprom_create_empty_file (void)
@@ -54,6 +60,13 @@ static FILE *eeprom_create_empty_file (void)
 
 static FILE* EEPROM_FP = NULL;
 
+// RAM-backed fallback when the settings file can neither be opened nor
+// created (read-only or full filesystem): the controller keeps running on
+// defaults for the life of the process instead of faulting on the first
+// settings access. Reads as erased until written.
+static uint8_t eeprom_ram[MAX_EEPROM_SIZE];
+static bool eeprom_volatile = false;
+
 static FILE *eeprom_fp (void)
 {
     static int tried = 0;
@@ -63,6 +76,13 @@ static FILE *eeprom_fp (void)
         EEPROM_FP = fopen(eeprom_file, "r+b");
         if (!EEPROM_FP) {
             EEPROM_FP = eeprom_create_empty_file();
+        }
+        if (!EEPROM_FP) {
+            fprintf(stderr, "eeprom: cannot open or create %s: %s - "
+                            "settings are volatile for this run\n",
+                    eeprom_file, strerror(errno));
+            memset(eeprom_ram, 0xFF, sizeof(eeprom_ram));
+            eeprom_volatile = true;
         }
     }
 
@@ -83,8 +103,14 @@ uint8_t eeprom_get_char(uint32_t addr )
 {
     FILE* fp = eeprom_fp();
 
+    if (addr >= MAX_EEPROM_SIZE)
+        return 0xFF; //no such address: reads as erased
+
+    if (!fp)
+        return eeprom_volatile ? eeprom_ram[addr] : 0xFF;
+
     if (fseek(fp, addr, SEEK_SET))
-        return 0; //no such address
+        return 0xFF; //no such address
 
     return fgetc(fp);
 }
@@ -92,6 +118,15 @@ uint8_t eeprom_get_char(uint32_t addr )
 void eeprom_put_char(uint32_t addr, uint8_t new_value )
 {
     FILE* fp = eeprom_fp();
+
+    if (addr >= MAX_EEPROM_SIZE)
+        return; //no such address
+
+    if (!fp) {
+        if (eeprom_volatile)
+            eeprom_ram[addr] = new_value;
+        return;
+    }
 
     if (fseek(fp, addr, SEEK_SET))
         return; //no such address

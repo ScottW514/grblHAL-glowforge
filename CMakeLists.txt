@@ -33,6 +33,12 @@ else()
     set(DRV_BUILD_TYPE "${CMAKE_BUILD_TYPE}")
 endif()
 string(STRIP "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_${_drv_build_type}}" DRV_C_FLAGS)
+# Keep host build directories out of the binary: distro toolchains pass
+# path-remapping and sysroot flags that only describe the build machine.
+string(REGEX REPLACE "-f[a-z-]*prefix-map=[^ ]*" "" DRV_C_FLAGS "${DRV_C_FLAGS}")
+string(REGEX REPLACE "--sysroot=[^ ]*" "" DRV_C_FLAGS "${DRV_C_FLAGS}")
+string(REGEX REPLACE "  +" " " DRV_C_FLAGS "${DRV_C_FLAGS}")
+string(STRIP "${DRV_C_FLAGS}" DRV_C_FLAGS)
 configure_file(
     ${CMAKE_CURRENT_LIST_DIR}/src/build_info.h.in
     ${CMAKE_CURRENT_BINARY_DIR}/build_info.h

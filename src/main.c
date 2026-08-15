@@ -111,13 +111,21 @@ int main (int argc, char *argv[])
             switch(argv[0][1]) {
 
                 case 'e':
+                    if(argc < 2 || !set_eeprom_name(argv[1])) {
+                        printf("Option -e needs a settings file path (under 128 characters).\n");
+                        print_usage(NULL);
+                        return EXIT_FAILURE;
+                    }
                     argv++; argc--;
-                    set_eeprom_name(*argv);
                     break;
 
                 case 'p':
+                    if(argc < 2 || (port = atoi(argv[1])) <= 0 || port > 65535) {
+                        printf("Option -p needs a TCP port (1-65535).\n");
+                        print_usage(NULL);
+                        return EXIT_FAILURE;
+                    }
                     argv++; argc--;
-                    port = atoi(*argv);
                     break;
 
                 case 'v':
@@ -154,7 +162,10 @@ int main (int argc, char *argv[])
 
         struct sockaddr_in server_addr = {0};
 
-        if((listen_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        // Close-on-exec: the homing runner is fork+exec'd from this
+        // process and must not inherit the listen socket (a straggling
+        // child would keep the port bound across a controller respawn).
+        if((listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0) {
             printf("Fatal: Unable to create socket.\n");
             exit(-5);
         }

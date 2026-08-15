@@ -239,13 +239,22 @@ static void report_now (void)
 /* ---------------------------------------------------------- verdict */
 
 /* Minimal field extraction from the engine's fixed JSON (we own the
- * writer; keys are matched, order is not assumed). */
-static bool json_bool (const char *body, const char *key)
+ * writer; keys are matched, order is not assumed). A key that is absent
+ * takes the caller's default, which is always the fail-safe direction:
+ * fire blocked, hold on, resume refused. */
+static bool json_bool (const char *body, const char *key, bool dflt)
 {
     char pat[24];
     snprintf(pat, sizeof(pat), "\"%s\":", key);
     const char *p = strstr(body, pat);
-    return p && !strncmp(p + strlen(pat), "true", 4);
+    if(!p)
+        return dflt;
+    p += strlen(pat);
+    if(!strncmp(p, "true", 4))
+        return true;
+    if(!strncmp(p, "false", 5))
+        return false;
+    return dflt;
 }
 
 static bool json_num (const char *body, const char *key, double *out)
@@ -281,13 +290,19 @@ static void json_str (const char *body, const char *key, char *out, size_t len)
  * fire blocked, hold on. */
 static void verdict_read (void)
 {
-    char body[384];
+    char body[1024];
     FILE *f = fopen(verdict_file, "r");
     if(!f)
         return;
     size_t n = fread(body, 1, sizeof(body) - 1, f);
     fclose(f);
     body[n] = '\0';
+
+    /* Only a complete document is trusted: the publisher writes the
+     * whole object and renames it into place, so a body without its
+     * closing brace is a torn or oversized read, not a verdict. */
+    if(n == 0 || memchr(body, '}', n) == NULL)
+        return;
 
     double ts_mono;
     if(!json_num(body, "ts_mono", &ts_mono))
@@ -300,9 +315,9 @@ static void verdict_read (void)
         return;     /* stale publisher; let the cache expire */
 
     /* Flags first, deadline last (release): see the cache comment. */
-    atomic_store_explicit(&v_hold, json_bool(body, "hold"), memory_order_relaxed);
-    atomic_store_explicit(&v_resume_ok, json_bool(body, "resume_ok"), memory_order_relaxed);
-    atomic_store_explicit(&v_fire_ok, json_bool(body, "fire_ok"), memory_order_relaxed);
+    atomic_store_explicit(&v_hold, json_bool(body, "hold", true), memory_order_relaxed);
+    atomic_store_explicit(&v_resume_ok, json_bool(body, "resume_ok", false), memory_order_relaxed);
+    atomic_store_explicit(&v_fire_ok, json_bool(body, "fire_ok", false), memory_order_relaxed);
     json_str(body, "reason", v_reason, sizeof(v_reason));
     atomic_store_explicit(&v_fresh_until_ms,
         mono_ms() + (uint32_t)(VERDICT_MAX_AGE_MS - (uint32_t)(age * 1000.0)),

@@ -8,6 +8,7 @@
 */
 
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -42,13 +43,24 @@ void gfio_set_hw (bool active)
 int gfio_wr_attr (const char *attr, const char *val)
 {
     char path[128];
-    int fd, ret;
+    int fd, ret = 0;
+    size_t len = strlen(val);
     if(!gfio_hw)
         return 0;
     snprintf(path, sizeof(path), GF_SYSFS "%s", attr);
-    if((fd = open(path, O_WRONLY)) < 0)
-        return -1;
-    ret = write(fd, val, strlen(val)) < 0 ? -1 : 0;
+    if((fd = open(path, O_WRONLY | O_CLOEXEC)) < 0)
+        return errno == ENOENT ? GFIO_ENOATTR : GFIO_EREJECT;
+    /* A sysfs store consumes the whole buffer or rejects it; anything
+     * short of a full write is a rejection, and EINTR is retried. */
+    for(;;) {
+        ssize_t w = write(fd, val, len);
+        if(w == (ssize_t)len)
+            break;
+        if(w < 0 && errno == EINTR)
+            continue;
+        ret = GFIO_EREJECT;
+        break;
+    }
     close(fd);
     return ret;
 }

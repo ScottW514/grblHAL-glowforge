@@ -100,7 +100,7 @@ static void driver_delay_ms (uint32_t ms, void (*callback)(void))
              * wait would blind real-time commands for its whole span
              * (serial_wait wakes early on traffic). */
             uint32_t until = millis() + ms;
-            while((int32_t)(until - millis()) > 0) {
+            while((int32_t)(until - millis()) > 0 && !sys.abort) {
                 serial_wait(1000);
                 serial_poll();
             }

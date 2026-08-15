@@ -244,7 +244,7 @@ static void rx_poll (void)
         // Always accept: a new connection displaces any current session
         // (last connection wins - single-operator machine, and a client
         // that died without FIN would otherwise hold the port forever).
-        int fd = accept(listen_fd, NULL, NULL);
+        int fd = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
         if(fd >= 0) {
             drop_client();
             int flags = fcntl(fd, F_GETFL, 0);
@@ -317,7 +317,10 @@ void serial_poll (void)
 
 void serial_wait (long timeout_us)
 {
-    struct timespec ts = { .tv_sec = 0, .tv_nsec = timeout_us * 1000 };
+    if(timeout_us < 0)
+        timeout_us = 0;
+    struct timespec ts = { .tv_sec = timeout_us / 1000000,
+                           .tv_nsec = (timeout_us % 1000000) * 1000 };
     struct pollfd fds[2];
     nfds_t n = 0;
 
