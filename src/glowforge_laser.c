@@ -38,6 +38,10 @@
   went bad during the wait. While unarmed or gated, fire requests are
   suppressed at the stream and reported.
 
+  Gates, in order, at the first laser-on of a job: the coolant verdict
+  (fire_ok), head presence (the head driver has probed - lens, air assist
+  and beam detector are on the head), then the operator's button press.
+
   Config keys (shared machine config, re-read at each arm):
     laser_button_timeout_s   button wait budget (default 300; clamped
                              to 1-3600 - out-of-range values fall back
@@ -177,6 +181,20 @@ static bool gflaser_arm (void)
         report_message("laser fire blocked: coolant flow fault or over-temperature", Message_Warning);
         system_raise_alarm(Alarm_AbortCycle);
         return false;
+    }
+
+    /* No head, no beam: the lens, air assist and beam detector live on
+     * the head, and the hardware safety chain does not include head
+     * presence. Presence is the head driver having probed - its sysfs
+     * group exists - not the EV_SW head line. Checked before the latch
+     * is unlocked and before the button ever lights. */
+    if(hw_active) {
+        char hall[16];
+        if(gfio_rd_attr("head/hall_sensor", hall, sizeof(hall)) != 0) {
+            report_message("laser fire blocked: no head detected", Message_Warning);
+            system_raise_alarm(Alarm_AbortCycle);
+            return false;
+        }
     }
 
     /* Fan run profile + flow interrogation cover the whole armed
