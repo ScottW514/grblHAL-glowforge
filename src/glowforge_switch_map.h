@@ -50,3 +50,39 @@ static inline control_signals_t gfsw_map_bits (const uint8_t *sw,
 
     return signals;
 }
+
+/* The control signals the core should see, given its state. This is the
+   single policy behind both hal.control.get_state() and the edge
+   delivery: the safety-door signal is withheld while the core is IDLE,
+   JOG or HOMING and shown as-is in every other state. Rationale: the beam
+   is blocked in hardware whenever the lid or the interlock loop is open;
+   the lid is opened at idle every time material is loaded; and a door the
+   core sees while idle - at boot, on a stop, or as an edge - strands the
+   controller in Door until a cycle start. In a running or held job, a
+   tool change, or an existing door state the signal is live, so a job
+   started with the lid open parks on the first poll and a mid-job open
+   parks exactly as before. Everything else (e-stop) is always visible. */
+static inline control_signals_t gfsw_visible (control_signals_t now,
+                                              sys_state_t state)
+{
+    if(state == STATE_IDLE || state == STATE_JOG || state == STATE_HOMING)
+        now.safety_door_ajar = Off;
+
+    return now;
+}
+
+/* Diffs what the core should see now against what it has already been
+   told: *on = newly asserted signals, *off = signals to report as
+   deasserted (deasserted flag set). Returns the new "told" state. */
+static inline control_signals_t gfsw_edges (control_signals_t want,
+                                            control_signals_t delivered,
+                                            control_signals_t *on,
+                                            control_signals_t *off)
+{
+    on->bits = want.bits & ~delivered.bits;
+    off->bits = delivered.bits & ~want.bits;
+    if(off->bits)
+        off->deasserted = On;
+
+    return want;
+}

@@ -39,9 +39,17 @@
                                 Basic/Plus ship the connector jumpered, so the
                                 bit rests inactive there.
 
-  Opening the lid mid-job therefore parks the job in the door state and closing
-  it resumes, which is also what the hardware does to the beam - OK_2_FIRE
-  drops the moment the chain opens, with or without this code.
+  Opening the lid mid-job therefore parks the job in the door state; once it
+  is closed a cycle start resumes it. The hardware does the same to the beam
+  regardless - the button latch sets the moment the lid opens, and the kernel
+  sets the interlock latch when the loop opens. While the core is IDLE, JOG
+  or HOMING the door signal is deliberately hidden from it (gfsw_visible,
+  applied to both get_state() and the edge delivery): the lid is opened at
+  idle every time material is loaded, the beam is blocked in hardware anyway,
+  and a door seen while idle - at boot, on a stop, or as an edge - strands
+  the controller in Door until a cycle start. The signal becomes visible,
+  and is delivered, the moment the core is in any other state, so a job
+  started with the lid open parks on the first poll.
 
   The e-stop bit (4) is a sense line whose resting state is ACTIVE on a healthy
   machine, and on the factory board it drops for the duration of any stepper
@@ -60,6 +68,8 @@
 #include "glowforge_switch_map.h"
 #include "glowforge_io.h"
 
+#include "grbl/state_machine.h"
+
 #include <fcntl.h>
 #include <linux/input.h>
 #include <stdio.h>
@@ -71,7 +81,8 @@
 
 static int sw_fd = -1;
 static bool estop_gates_motion = false;
-static control_signals_t state = {0};
+static control_signals_t state = {0};      /* raw reading of the switch device */
+static control_signals_t delivered = {0};  /* asserted signals the core has been told about */
 
 /* Reads the switch device and maps it onto control signals (the pure
    mapping lives in glowforge_switch_map.h, unit-tested on the host).
@@ -117,31 +128,31 @@ void gfsw_init (void)
 
 control_signals_t gfsw_get_state (void)
 {
-    return state;
+    return gfsw_visible(state, state_get());
 }
 
 void gfsw_poll (void)
 {
-    control_signals_t now = {0}, changed;
+    control_signals_t now = {0}, want, on, off;
 
     if(sw_fd < 0 || !read_signals(&now))
         return;
 
-    if(now.bits == state.bits)
-        return;
-
-    changed.bits = now.bits ^ state.bits;
     state = now;
 
-    /* Assertions and deassertions are reported separately: the core treats a
+    /* What the core should currently see as asserted, given its state
+       (the door signal is hidden while IDLE/JOG/HOMING - see gfsw_visible),
+       diffed against what it has already been told. This also delivers a
+       still-open door the moment the core leaves those states. Assertions
+       and deassertions are reported separately: the core treats a
        deasserted report as clearing, and reads the door state back through
        get_state() to decide when to leave the door state. */
-    if(changed.bits & now.bits)
-        hal.control.interrupt_callback((control_signals_t){ .bits = changed.bits & now.bits });
+    want = gfsw_visible(now, state_get());
+    delivered = gfsw_edges(want, delivered, &on, &off);
 
-    if(changed.bits & ~now.bits) {
-        control_signals_t off = { .bits = changed.bits & ~now.bits };
-        off.deasserted = On;
+    if(on.bits)
+        hal.control.interrupt_callback(on);
+
+    if(off.bits)
         hal.control.interrupt_callback(off);
-    }
 }

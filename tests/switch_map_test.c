@@ -13,6 +13,10 @@
     - e-stop (bit 4) rests ACTIVE on a healthy machine; the assertion
       is the line dropping, and only when gating is enabled
 
+  Also covers the visibility policy (gfsw_visible / gfsw_edges): the
+  door signal is hidden from the core while IDLE, JOG or HOMING and
+  delivered the moment it is in any other state.
+
   Copyright (c) 2026 Scott Wiederhold <s.e.wiederhold@gmail.com>
   SPDX-License-Identifier: GPL-3.0-or-later
 */
@@ -86,6 +90,71 @@ int main (void)
     /* ...and the resting-active line is not an assertion. */
     s = gfsw_map_bits(mask(true, true, false), true);
     expect("resting e-stop sense does not assert", s.e_stop, false);
+
+    /* ---- visibility policy: what the core sees, by its state ---- */
+
+    control_signals_t open_lid = gfsw_map_bits(mask(false, true, false), false);
+    control_signals_t open_loop = gfsw_map_bits(mask(true, true, true), false);
+    control_signals_t estop_on = gfsw_map_bits(mask(true, false, false), true);
+
+    /* Idle, jog and homing: an open lid or loop is hidden (the beam is
+       blocked in hardware; a door seen here strands the core in Door). */
+    expect("open lid hidden while IDLE", gfsw_visible(open_lid, STATE_IDLE).safety_door_ajar, false);
+    expect("open lid hidden while JOG", gfsw_visible(open_lid, STATE_JOG).safety_door_ajar, false);
+    expect("open lid hidden while HOMING", gfsw_visible(open_lid, STATE_HOMING).safety_door_ajar, false);
+    expect("open loop hidden while IDLE", gfsw_visible(open_loop, STATE_IDLE).safety_door_ajar, false);
+
+    /* Any job-time state: visible as-is. */
+    expect("open lid visible in CYCLE", gfsw_visible(open_lid, STATE_CYCLE).safety_door_ajar, true);
+    expect("open lid visible in HOLD", gfsw_visible(open_lid, STATE_HOLD).safety_door_ajar, true);
+    expect("open lid visible in SAFETY_DOOR", gfsw_visible(open_lid, STATE_SAFETY_DOOR).safety_door_ajar, true);
+    expect("open lid visible in TOOL_CHANGE", gfsw_visible(open_lid, STATE_TOOL_CHANGE).safety_door_ajar, true);
+    expect("open loop visible in CYCLE", gfsw_visible(open_loop, STATE_CYCLE).safety_door_ajar, true);
+
+    /* E-stop is never hidden. */
+    expect("e-stop visible while IDLE", gfsw_visible(estop_on, STATE_IDLE).e_stop, true);
+    expect("e-stop visible in CYCLE", gfsw_visible(estop_on, STATE_CYCLE).e_stop, true);
+
+    /* ---- delivery sequence: the load-material lid cycle, then a job ---- */
+
+    control_signals_t told = {0}, on, off, want;
+    control_signals_t closed = gfsw_map_bits(mask(true, true, false), false);
+
+    /* Lid opened and closed at idle: nothing is delivered either way. */
+    want = gfsw_visible(open_lid, STATE_IDLE);
+    told = gfsw_edges(want, told, &on, &off);
+    expect("idle lid open delivers nothing", on.bits == 0 && off.bits == 0, true);
+    want = gfsw_visible(closed, STATE_IDLE);
+    told = gfsw_edges(want, told, &on, &off);
+    expect("idle lid close delivers nothing", on.bits == 0 && off.bits == 0, true);
+
+    /* Job started with the lid open: delivered on the first non-idle poll,
+       and only once. */
+    want = gfsw_visible(open_lid, STATE_IDLE);
+    told = gfsw_edges(want, told, &on, &off);
+    want = gfsw_visible(open_lid, STATE_CYCLE);
+    told = gfsw_edges(want, told, &on, &off);
+    expect("lid open at job start is delivered", on.safety_door_ajar && !on.deasserted, true);
+    told = gfsw_edges(gfsw_visible(open_lid, STATE_SAFETY_DOOR), told, &on, &off);
+    expect("...and only once", on.bits == 0 && off.bits == 0, true);
+
+    /* Lid closed while parked: reported as a deassertion, so the next open
+       is delivered again. */
+    want = gfsw_visible(closed, STATE_SAFETY_DOOR);
+    told = gfsw_edges(want, told, &on, &off);
+    expect("lid close while parked reports deassert", off.safety_door_ajar && off.deasserted, true);
+    want = gfsw_visible(open_lid, STATE_CYCLE);
+    told = gfsw_edges(want, told, &on, &off);
+    expect("mid-job open is delivered", on.safety_door_ajar, true);
+
+    /* Reset to idle with the lid still open: the core is told it cleared
+       (it ignores door deasserts) and a later idle close stays silent. */
+    want = gfsw_visible(open_lid, STATE_IDLE);
+    told = gfsw_edges(want, told, &on, &off);
+    expect("back to idle clears the delivered door", off.safety_door_ajar && told.safety_door_ajar == Off, true);
+    want = gfsw_visible(closed, STATE_IDLE);
+    told = gfsw_edges(want, told, &on, &off);
+    expect("idle close after that stays silent", on.bits == 0 && off.bits == 0, true);
 
     if(failures) {
         printf("FAIL: %d switch-map case(s)\n", failures);
