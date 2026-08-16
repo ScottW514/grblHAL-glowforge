@@ -24,8 +24,8 @@
 /*
   The machine's switches arrive as EV_SW bits on a gpio-keys input device.
   State is read with EVIOCGSW, never a grab: forgectrl polls the same device
-  for the status panel, and the laser arm flow reads the button from its own
-  descriptor.
+  for the status panel, and the laser arm flow reads the button through
+  gfsw_read_raw().
 
   Two of the bits gate motion, mapped onto the core's safety-door signal
   because that is what they mean - the machine cannot fire:
@@ -39,17 +39,33 @@
                                 Basic/Plus ship the connector jumpered, so the
                                 bit rests inactive there.
 
-  Opening the lid mid-job therefore parks the job in the door state; once it
-  is closed a cycle start resumes it. The hardware does the same to the beam
-  regardless - the button latch sets the moment the lid opens, and the kernel
-  sets the interlock latch when the loop opens. While the core is IDLE, JOG
-  or HOMING the door signal is deliberately hidden from it (gfsw_visible,
-  applied to both get_state() and the edge delivery): the lid is opened at
-  idle every time material is loaded, the beam is blocked in hardware anyway,
-  and a door seen while idle - at boot, on a stop, or as an edge - strands
-  the controller in Door until a cycle start. The signal becomes visible,
-  and is delivered, the moment the core is in any other state, so a job
-  started with the lid open parks on the first poll.
+  What a job does when one of them opens is the factory firmware's policy
+  (lid_policy = cancel, the default): the core parks the job in the door
+  state - a planned deceleration with the laser off and the position kept -
+  and the moment it is parked the job is CANCELLED: the armed window closes,
+  the reason is reported, a soft reset ends the sender's stream (the
+  position is not lost - the reset comes from a fully parked state, so no
+  alarm), and the head returns on its own to where the job started, lid
+  open or not. The next job re-arms with a fresh button press, which is
+  the same press the hardware button latch (set by the lid) needs. With
+  lid_policy = hold the door parks the job and a cycle start resumes it
+  once the lid is closed - stock grblHAL behavior; the hardware still needs
+  a button press before the beam returns.
+
+  While the core is IDLE, JOG or HOMING the door signal is deliberately
+  hidden from it (gfsw_visible, applied to both get_state() and the edge
+  delivery): the lid is opened at idle every time material is loaded, the
+  beam is blocked in hardware anyway, and a door seen while idle - at boot,
+  on a stop, or as an edge - strands the controller in Door until a cycle
+  start. It is also hidden during the return-to-start motion after a
+  cancel, which runs with the latch locked. The signal becomes visible, and
+  is delivered, the moment the core is in any other state, so a job started
+  with the lid open parks (and cancels) on the first poll.
+
+  The button (bit 2) is the operator's consent in the arm flow (the wait
+  reads it through gfsw_read_raw()) and, outside the arm wait, the job
+  pause/resume toggle: a press while a job runs is a feed hold, a press
+  while it is held is a cycle start. A hold has no further meaning.
 
   Bit 4 (hv_enable) is the readback of the board's HV_ENABLE output, not an
   input: it is low at idle and high only while a run feeds the charge-pump
@@ -61,10 +77,6 @@
   state on a healthy machine is not characterized, and a false assertion would
   wedge every job. The hardware chain enforces it regardless.
 
-  The button (bit 2) is not a control signal: the laser arm flow reads it
-  through gfsw_read_raw() as the operator's consent, and nothing else in
-  the controller acts on it.
-
   Test hook: with GF_SWITCH_FILE set (and no device, i.e. a null-sink host
   build), the EV_SW word is read from that file instead - an integer,
   decimal or 0x-hex, holding the bitmask exactly as EVIOCGSW would return
@@ -75,8 +87,14 @@
 #include "fflog.h"
 #include "glowforge_switches.h"
 #include "glowforge_switch_map.h"
+#include "glowforge_io.h"
+#include "glowforge_laser.h"
 
+#include "grbl/hal.h"
+#include "grbl/protocol.h"
+#include "grbl/report.h"
 #include "grbl/state_machine.h"
+#include "grbl/system.h"
 
 #include <fcntl.h>
 #include <linux/input.h>
@@ -84,14 +102,48 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #define SWITCH_DEV        "/dev/input/event0"
+
+/* Config key: what an open lid / interlock loop does to a running job.
+   "cancel" (default) = the factory's abort + return to the job start;
+   "hold" = stock grblHAL door hold, cycle start resumes. Re-read at each
+   door event, so a change applies to the next job. */
+#define LID_POLICY_KEY    "lid_policy"
+
+/* Give the return-to-start park a moment to be accepted / to start. */
+#define PARK_ENQUEUE_RETRY_S   2.0
+#define PARK_ZERO_LENGTH_S     1.0
 
 static int sw_fd = -1;
 static const char *fake_path;              /* GF_SWITCH_FILE (host tests) */
 static control_signals_t state = {0};      /* raw reading of the switch device */
 static control_signals_t delivered = {0};  /* asserted signals the core has been told about */
+static uint8_t raw[SW_BYTES];              /* last raw word (button, reason strings) */
+static bool button_prev;                   /* button level at the previous poll */
+
+/* The cancel policy's state (see the file header). */
+static enum {
+    Cancel_None = 0,       /* nothing pending */
+    Cancel_ResetSent,      /* job cancelled, soft reset queued; wait for Idle */
+    Cancel_ParkQueued      /* return-to-start motion enqueued; wait for it to end */
+} cancel_state = Cancel_None;
+static bool door_hidden;                   /* hide the door through reset + park */
+static double park_at;                     /* wall time the park was enqueued / retried from */
+static bool park_saw_cycle;
+static bool have_job_start;
+static float job_start[N_AXIS];            /* machine position when the job began */
+static sys_state_t prev_state = STATE_IDLE;
+static on_state_change_ptr on_state_change_chain;
+
+static double wall_s (void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
+}
 
 bool gfsw_available (void)
 {
@@ -131,14 +183,49 @@ bool gfsw_read_raw (uint8_t *sw)
    lives in glowforge_switch_map.h, unit-tested on the host). */
 static bool read_signals (control_signals_t *signals)
 {
-    uint8_t sw[SW_BYTES];
-
-    if(!gfsw_read_raw(sw))
+    if(!gfsw_read_raw(raw))
         return false;
 
-    *signals = gfsw_map_bits(sw);
+    *signals = gfsw_map_bits(raw);
 
     return true;
+}
+
+static bool lid_cancels (void)
+{
+    char v[16] = "";
+    if(gfio_conf_read(LID_POLICY_KEY, v, sizeof(v)) == 0 && strcmp(v, "hold") == 0)
+        return false;
+    return true;
+}
+
+/* The core's view of the door: the pure visibility policy, plus the
+   cancel path's own hiding through the reset and the return-to-start
+   motion (both run with the latch locked; a door seen there would
+   re-park the park). */
+static control_signals_t visible (control_signals_t now)
+{
+    now = gfsw_visible(now, state_get());
+    if(door_hidden)
+        now.safety_door_ajar = Off;
+    return now;
+}
+
+/* Job start = the machine position at the Idle -> Cycle transition of a
+   job (not a jog, not the park itself): where a cancelled job's head
+   returns to, as the factory returns to its job origin. */
+static void onStateChange (sys_state_t new_state)
+{
+    if(new_state == STATE_CYCLE && prev_state == STATE_IDLE && cancel_state == Cancel_None) {
+        int32_t steps[N_AXIS];
+        memcpy(steps, sys.position, sizeof(steps));
+        system_convert_array_steps_to_mpos(job_start, steps);
+        have_job_start = true;
+    }
+    prev_state = new_state;
+
+    if(on_state_change_chain)
+        on_state_change_chain(new_state);
 }
 
 void gfsw_init (void)
@@ -154,6 +241,9 @@ void gfsw_init (void)
             fake_path = p;
     }
 
+    on_state_change_chain = grbl.on_state_change;
+    grbl.on_state_change = onStateChange;
+
     if(!gfsw_available()) {
         /* Null-sink/host builds have no switch source: nothing to gate on. */
         hal.signals_cap.safety_door_ajar = Off;
@@ -164,6 +254,7 @@ void gfsw_init (void)
 
     if(read_signals(&initial))
         state = initial;
+    button_prev = gfsw_bit_set(raw, SW_BIT_BUTTON);
 
     if(state.safety_door_ajar)
         fflog(LOG_WARNING, "gfswitch: lid open or interlock loop open at startup");
@@ -171,26 +262,145 @@ void gfsw_init (void)
 
 control_signals_t gfsw_get_state (void)
 {
-    return gfsw_visible(state, state_get());
+    return visible(state);
+}
+
+/* --- the button: pause / resume toggle outside the arm wait ------------- */
+
+void gfsw_button_consumed (void)
+{
+    button_prev = true;
+}
+
+static void button_edge (sys_state_t st)
+{
+    if(gflaser_arming())
+        return;                     /* that press is the arm's consent */
+
+    if(st == STATE_CYCLE) {
+        protocol_enqueue_realtime_command(CMD_FEED_HOLD);
+        report_message("button pressed - job paused", Message_Info);
+    } else if(st == STATE_HOLD) {
+        protocol_enqueue_realtime_command(CMD_CYCLE_START);
+        report_message("button pressed - job resumed", Message_Info);
+    }
+    /* Idle, jog, homing, door, alarm: a press means nothing here. */
+}
+
+/* --- the door: cancel policy --------------------------------------------- */
+
+static bool door_parked (sys_state_t st)
+{
+    return st == STATE_SAFETY_DOOR &&
+            (sys.parking_state == Parking_DoorAjar || sys.parking_state == Parking_DoorClosed);
+}
+
+static void cancel_job (void)
+{
+    /* Latch first: FIRE is severed before anything else happens (the
+       hold already turned the spindle off; this closes the armed window
+       and relocks the kernel latch). */
+    gflaser_disarm();
+
+    const char *why = gfsw_bit_set(raw, SW_BIT_INTERLOCK) && gfsw_bit_set(raw, SW_BIT_DOORS)
+                       ? "interlock open" : "lid opened";
+    char msg[96];
+    snprintf(msg, sizeof(msg), "%s - job cancelled%s", why,
+             have_job_start ? ", returning to the job start" : "");
+    report_message(msg, Message_Warning);
+    fflog(LOG_NOTICE, "gfswitch: %s", msg);
+
+    /* Hide the door from here on: the reset's re-init and the park must
+       not see it. Cleared when the park has ended. */
+    door_hidden = true;
+    cancel_state = Cancel_ResetSent;
+    park_at = wall_s();
+
+    /* A soft reset from a fully parked door: no motion is in flight, so
+       the core keeps the position (no alarm 3); the sender's stream is
+       flushed and it sees the reset banner - the job is over for it. */
+    protocol_enqueue_realtime_command(CMD_RESET);
+}
+
+static void cancel_poll (sys_state_t st)
+{
+    switch(cancel_state) {
+
+        case Cancel_None:
+            if(door_parked(st) && lid_cancels())
+                cancel_job();
+            break;
+
+        case Cancel_ResetSent:
+            if(sys.reset_pending || st != STATE_IDLE) {
+                if(st & (STATE_ALARM | STATE_ESTOP)) {
+                    cancel_state = Cancel_None;     /* something else took over */
+                    door_hidden = false;
+                }
+                break;
+            }
+            if(!have_job_start) {
+                cancel_state = Cancel_None;
+                door_hidden = false;
+                break;
+            }
+            {
+                char cmd[64];
+                snprintf(cmd, sizeof(cmd), "G53G0X%.3fY%.3fZ%.3f",
+                         job_start[X_AXIS], job_start[Y_AXIS], job_start[Z_AXIS]);
+                if(grbl.enqueue_gcode(cmd)) {
+                    cancel_state = Cancel_ParkQueued;
+                    park_at = wall_s();
+                    park_saw_cycle = false;
+                } else if(wall_s() - park_at > PARK_ENQUEUE_RETRY_S) {
+                    report_message("return to the job start could not be queued", Message_Warning);
+                    cancel_state = Cancel_None;
+                    door_hidden = false;
+                }
+            }
+            break;
+
+        case Cancel_ParkQueued:
+            if(st == STATE_CYCLE)
+                park_saw_cycle = true;
+            else if(st & (STATE_ALARM | STATE_ESTOP)) {
+                cancel_state = Cancel_None;
+                door_hidden = false;
+            } else if(st == STATE_IDLE && (park_saw_cycle || wall_s() - park_at > PARK_ZERO_LENGTH_S)) {
+                /* Parked at the job start (or it was already there). */
+                report_message("returned to the job start", Message_Info);
+                cancel_state = Cancel_None;
+                door_hidden = false;
+            }
+            break;
+    }
 }
 
 void gfsw_poll (void)
 {
     control_signals_t now = {0}, want, on, off;
+    sys_state_t st = state_get();
 
     if(!gfsw_available() || !read_signals(&now))
         return;
 
     state = now;
 
+    /* Button edge: pause / resume, outside the arm wait. */
+    bool button = gfsw_bit_set(raw, SW_BIT_BUTTON);
+    if(button && !button_prev)
+        button_edge(st);
+    button_prev = button;
+
     /* What the core should currently see as asserted, given its state
-       (the door signal is hidden while IDLE/JOG/HOMING - see gfsw_visible),
-       diffed against what it has already been told. This also delivers a
-       still-open door the moment the core leaves those states. Assertions
-       and deassertions are reported separately: the core treats a
-       deasserted report as clearing, and reads the door state back through
-       get_state() to decide when to leave the door state. */
-    want = gfsw_visible(now, state_get());
+       (the door signal is hidden while IDLE/JOG/HOMING and through a
+       cancel - see visible()), diffed against what it has already been
+       told. This also delivers a still-open door the moment the core
+       leaves those states. Assertions and deassertions are reported
+       separately: the core treats a deasserted report as clearing, and
+       reads the door state back through get_state() to decide when to
+       leave the door state. */
+    want = visible(now);
     delivered = gfsw_edges(want, delivered, &on, &off);
 
     if(on.bits)
@@ -198,4 +408,6 @@ void gfsw_poll (void)
 
     if(off.bits)
         hal.control.interrupt_callback(off);
+
+    cancel_poll(st);
 }

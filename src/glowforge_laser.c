@@ -101,6 +101,7 @@ static _Atomic bool laser_ok = false;   /* armed window open */
 static double disarm_at;            /* 0 = no grace running */
 static unsigned armed_client_gen;   /* sender session the arm belongs to */
 static _Atomic bool disarm_request = false; /* program end: close the window */
+static _Atomic bool arming = false;         /* blocked in the button wait */
 static double disarmed_at;          /* margin for the sample-window lag */
 static double next_emission_check;  /* ~1 Hz witness pacing */
 static on_program_completed_ptr on_program_completed;
@@ -167,6 +168,11 @@ static void latch_lock (bool lock)
     gf_stream_laser_latch(lock);
 }
 
+bool gflaser_arming (void)
+{
+    return atomic_load(&arming);
+}
+
 void gflaser_disarm (void)
 {
     if(!laser_ok)
@@ -231,10 +237,12 @@ static bool gflaser_arm (void)
          * (the factory does the same; the hardware button latch sets on
          * the lid and would ignore a press anyway). */
         bool pressed = false, aborted = false;
+        arming = true;
         while(!pressed && !aborted) {
             switch(arm_switches()) {
                 case Arm_Pressed:
                     pressed = true;
+                    gfsw_button_consumed();   /* not a pause press */
                     break;
                 case Arm_LidOpen:
                     report_message("lid opened during arm - job cancelled", Message_Warning);
@@ -257,6 +265,7 @@ static bool gflaser_arm (void)
                     break;
             }
         }
+        arming = false;
         button_led(0);
 
         if(aborted) {

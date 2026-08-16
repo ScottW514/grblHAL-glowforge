@@ -42,6 +42,11 @@ bool gfsw_available (void);
    unreadable right now (keep the previous state). */
 bool gfsw_read_raw (uint8_t *sw);
 
+/* The arm flow took the current button press as the operator's consent:
+   the pause/resume toggle must not act on it (no edge until the button
+   is released and pressed again). */
+void gfsw_button_consumed (void);
+
 /* Current control-signal state; the hal.control.get_state backend. */
 control_signals_t gfsw_get_state (void);
 

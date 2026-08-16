@@ -62,6 +62,7 @@ bool gfcool_fire_ok(void)
 }
 
 bool gfsw_available(void) { return sw_present; }
+void gfsw_button_consumed(void) {}
 bool gfsw_read_raw(uint8_t *sw)
 {
     int i = sw_calls < sw_n ? sw_calls : sw_n - 1;
