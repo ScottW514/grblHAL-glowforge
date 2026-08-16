@@ -18,6 +18,7 @@
 
 /* EV_SW bits per the device tree (see glowforge_switches.c for the
    semantics and the SERVICES.md switch map for the shared contract). */
+#define SW_BIT_BUTTON     2   /* the big button; consumed by the laser arm flow */
 #define SW_BIT_DOORS      3
 #define SW_BIT_HV_ENABLE  4   /* readback of the HV_ENABLE output; monitoring only */
 #define SW_BIT_INTERLOCK  5

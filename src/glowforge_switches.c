@@ -60,6 +60,16 @@
   Bit 6 (interlock latch tripped) is deliberately not gated on: its resting
   state on a healthy machine is not characterized, and a false assertion would
   wedge every job. The hardware chain enforces it regardless.
+
+  The button (bit 2) is not a control signal: the laser arm flow reads it
+  through gfsw_read_raw() as the operator's consent, and nothing else in
+  the controller acts on it.
+
+  Test hook: with GF_SWITCH_FILE set (and no device, i.e. a null-sink host
+  build), the EV_SW word is read from that file instead - an integer,
+  decimal or 0x-hex, holding the bitmask exactly as EVIOCGSW would return
+  it. The host harnesses use it to open the lid, break the interlock loop
+  and press the button against the real gating code.
 */
 
 #include "fflog.h"
@@ -71,6 +81,7 @@
 #include <fcntl.h>
 #include <linux/input.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -78,18 +89,51 @@
 #define SWITCH_DEV        "/dev/input/event0"
 
 static int sw_fd = -1;
+static const char *fake_path;              /* GF_SWITCH_FILE (host tests) */
 static control_signals_t state = {0};      /* raw reading of the switch device */
 static control_signals_t delivered = {0};  /* asserted signals the core has been told about */
 
-/* Reads the switch device and maps it onto control signals (the pure
-   mapping lives in glowforge_switch_map.h, unit-tested on the host).
-   Leaves the previous state untouched if the device cannot be read, so
-   a transient read failure cannot fake a door event. */
+bool gfsw_available (void)
+{
+    return sw_fd >= 0 || fake_path != NULL;
+}
+
+/* Reads the raw EV_SW word (EVIOCGSW layout, SW_BYTES bytes). Returns
+   false when there is no switch source or it cannot be read right now;
+   callers keep their previous state then, so a transient read failure
+   never fakes an edge. */
+bool gfsw_read_raw (uint8_t *sw)
+{
+    memset(sw, 0, SW_BYTES);
+
+    if(sw_fd >= 0)
+        return ioctl(sw_fd, EVIOCGSW(SW_BYTES), sw) >= 0;
+
+    if(fake_path) {
+        char buf[32] = "";
+        FILE *f = fopen(fake_path, "r");
+        if(f == NULL)
+            return false;
+        bool ok = fgets(buf, sizeof(buf), f) != NULL;
+        fclose(f);
+        if(!ok)
+            return false;
+        unsigned long word = strtoul(buf, NULL, 0);
+        for(unsigned i = 0; i < SW_BYTES; i++)
+            sw[i] = (uint8_t)(word >> (8 * i));
+        return true;
+    }
+
+    return false;
+}
+
+/* Maps the current switch word onto control signals (the pure mapping
+   lives in glowforge_switch_map.h, unit-tested on the host). */
 static bool read_signals (control_signals_t *signals)
 {
-    uint8_t sw[SW_BYTES] = {0};
+    uint8_t sw[SW_BYTES];
 
-    if(sw_fd < 0 || ioctl(sw_fd, EVIOCGSW(sizeof(sw)), sw) < 0)
+    if(!gfsw_read_raw(sw))
         return false;
 
     *signals = gfsw_map_bits(sw);
@@ -105,7 +149,13 @@ void gfsw_init (void)
     hal.signals_cap.e_stop = Off;
 
     if((sw_fd = open(SWITCH_DEV, O_RDONLY | O_CLOEXEC)) < 0) {
-        /* Null-sink/host builds have no switch device: nothing to gate on. */
+        const char *p = getenv("GF_SWITCH_FILE");
+        if(p != NULL && *p != '\0')
+            fake_path = p;
+    }
+
+    if(!gfsw_available()) {
+        /* Null-sink/host builds have no switch source: nothing to gate on. */
         hal.signals_cap.safety_door_ajar = Off;
         return;
     }
@@ -128,7 +178,7 @@ void gfsw_poll (void)
 {
     control_signals_t now = {0}, want, on, off;
 
-    if(sw_fd < 0 || !read_signals(&now))
+    if(!gfsw_available() || !read_signals(&now))
         return;
 
     state = now;

@@ -22,9 +22,15 @@
   hw_active off (no GFSINK, as on the host) the two checks are the only
   gates in the path, so a scripted good-then-bad sequence isolates the
   post-wait re-check.
+
+  Also covers the button wait itself, with the switch source scripted:
+  the lid or the interlock loop opening during the wait cancels the job
+  (relock, alarm, never armed), a press with the lid open does not arm,
+  and a press with everything closed arms.
 */
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -41,11 +47,28 @@ static char  last_message[128];
 static bool  stream_armed;          /* gf_stream_laser_arm(true) reached? */
 static bool  latch_locked_last;
 
+/* Switch source: gfsw_read_raw() plays this script of EV_SW words, one
+   per call, holding the last entry. sw_present = gfsw_available(). */
+static bool     sw_present;
+static unsigned sw_script[8];
+static int      sw_n;
+static int      sw_calls;
+
 bool gfcool_fire_ok(void)
 {
     int i = fire_ok_calls < fire_ok_n ? fire_ok_calls : fire_ok_n - 1;
     fire_ok_calls++;
     return fire_ok_script[i];
+}
+
+bool gfsw_available(void) { return sw_present; }
+bool gfsw_read_raw(uint8_t *sw)
+{
+    int i = sw_calls < sw_n ? sw_calls : sw_n - 1;
+    sw_calls++;
+    sw[0] = (uint8_t)sw_script[i];
+    sw[1] = (uint8_t)(sw_script[i] >> 8);
+    return true;
 }
 
 void gfcool_laser_armed(bool armed) { (void)armed; }
@@ -98,7 +121,10 @@ static void reset_state(void)
     latch_locked_last = true;
     laser_ok = false;
     disarm_request = false;
-    hw_active = false;              /* host: no GFSINK, no button device */
+    hw_active = false;              /* host: no GFSINK */
+    sw_present = false;             /* no switch source: no button wait */
+    sw_calls = 0;
+    sw_n = 0;
 }
 
 static void script(bool a, bool b, int n)
@@ -106,6 +132,23 @@ static void script(bool a, bool b, int n)
     fire_ok_script[0] = a;
     fire_ok_script[1] = b;
     fire_ok_n = n;
+}
+
+/* EV_SW words: bit 2 button, bit 3 doors (closed = set), bit 5 interlock
+   loop (set = OPEN). */
+#define W_CLOSED         (1u << SW_BIT_DOORS)
+#define W_PRESSED        (W_CLOSED | (1u << SW_BIT_BUTTON))
+#define W_LID_OPEN       0u
+#define W_LID_OPEN_PRESS (1u << SW_BIT_BUTTON)
+#define W_LOOP_OPEN      (W_CLOSED | (1u << SW_BIT_INTERLOCK))
+
+static void switches(unsigned a, unsigned b, unsigned c, int n)
+{
+    sw_present = true;
+    sw_script[0] = a;
+    sw_script[1] = b;
+    sw_script[2] = c;
+    sw_n = n;
 }
 
 int main(void)
@@ -142,8 +185,51 @@ int main(void)
     CHECK(!laser_ok, "armed window stays closed on the early refusal");
     CHECK(fire_ok_calls == 1, "the pre-wait check short-circuits the arm");
 
+    printf("gflaser_arm() button wait against the switches:\n");
+
+    /* Case D - the operator presses with everything closed: arms. */
+    reset_state();
+    script(true, true, 2);
+    switches(W_CLOSED, W_CLOSED, W_PRESSED, 3);
+    bool armed_d = gflaser_arm();
+    CHECK(armed_d, "press with lid and loop closed arms");
+    CHECK(laser_ok && stream_armed, "armed window opens on the press");
+    CHECK(alarms_raised == 0, "no alarm on a clean arm");
+
+    /* Case E - the lid opens during the wait: the job is cancelled. */
+    reset_state();
+    script(true, true, 2);
+    switches(W_CLOSED, W_CLOSED, W_LID_OPEN, 3);
+    bool armed_e = gflaser_arm();
+    CHECK(!armed_e, "lid open during the wait refuses");
+    CHECK(!laser_ok && !stream_armed, "armed window never opens on a lid open");
+    CHECK(latch_locked_last, "latch relocked on the lid open");
+    CHECK(alarms_raised == 1, "alarm raised on the lid open");
+    CHECK(strstr(last_message, "lid opened") != NULL, "reports the lid as the reason");
+    CHECK(fire_ok_calls == 1, "the post-wait coolant check is not reached");
+
+    /* Case F - a press with the lid open does not arm; the lid wins. */
+    reset_state();
+    script(true, true, 2);
+    switches(W_CLOSED, W_LID_OPEN_PRESS, W_LID_OPEN_PRESS, 3);
+    bool armed_f = gflaser_arm();
+    CHECK(!armed_f, "press with the lid open does not arm");
+    CHECK(!laser_ok && latch_locked_last, "lid-open press leaves the latch locked");
+    CHECK(strstr(last_message, "lid opened") != NULL, "lid-open press reported as the lid");
+
+    /* Case G - the interlock loop opens during the wait: cancelled too. */
+    reset_state();
+    script(true, true, 2);
+    switches(W_CLOSED, W_LOOP_OPEN, W_LOOP_OPEN, 3);
+    bool armed_g = gflaser_arm();
+    CHECK(!armed_g, "interlock open during the wait refuses");
+    CHECK(!laser_ok && latch_locked_last, "interlock open leaves the latch locked");
+    CHECK(alarms_raised == 1, "alarm raised on the interlock open");
+    CHECK(strstr(last_message, "interlock") != NULL, "reports the interlock as the reason");
+
     printf(failures ? "FAIL: %d check(s) failed\n"
-                    : "PASS: the arm re-checks the coolant gate after the wait\n",
+                    : "PASS: the arm re-checks the coolant gate after the wait "
+                      "and the button wait honors the lid and the interlock\n",
            failures);
     return failures ? 1 : 0;
 }

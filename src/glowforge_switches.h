@@ -26,9 +26,21 @@
 
 #include "grbl/hal.h"
 
-/* Opens the switch device and reads the initial state. Safe to call with no
-   hardware present (null-sink mode), where every signal reads clear. */
+#include <stdbool.h>
+#include <stdint.h>
+
+/* Opens the switch device (or the GF_SWITCH_FILE test source) and reads the
+   initial state. Safe to call with no hardware present (null-sink mode),
+   where every signal reads clear. */
 void gfsw_init (void);
+
+/* True when a switch source exists: the input device, or the file-backed
+   test source. Without one the laser arm flow has no button to wait for. */
+bool gfsw_available (void);
+
+/* Raw EV_SW word (SW_BYTES bytes, EVIOCGSW layout); false = no source or
+   unreadable right now (keep the previous state). */
+bool gfsw_read_raw (uint8_t *sw);
 
 /* Current control-signal state; the hal.control.get_state backend. */
 control_signals_t gfsw_get_state (void);

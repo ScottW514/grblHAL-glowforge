@@ -24,7 +24,10 @@
     3. lights the button white and BLOCKS the gcode stream - pumping
        real-time traffic like the homing session does - until the
        operator presses the physical button (EV_SW bit 2 on the input
-       device), a soft reset aborts, or the timeout expires.
+       device), a soft reset aborts, the lid or the interlock loop
+       opens (the job is cancelled: relock, alarm), or the timeout
+       expires. A press with the lid open does not arm - the hardware
+       button latch would not clear on it either.
 
   The armed window is JOB-based: it persists across the job (S changes
   and M5/M3 toggles do not re-prompt) and closes - relocking the
@@ -62,6 +65,8 @@
 #include "glowforge_laser.h"
 #include "glowforge_cooling.h"
 #include "glowforge_io.h"
+#include "glowforge_switches.h"
+#include "glowforge_switch_map.h"
 #include "stepper_stream.h"
 #include "serial.h"
 
@@ -72,18 +77,12 @@
 #include "grbl/system.h"
 
 #include <fcntl.h>
-#include <linux/input.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
-
-/* EV_SW bits per the device tree: 2 = the big button. */
-#define SWITCH_DEV     "/dev/input/event0"
-#define SW_BIT_BUTTON  2
 
 #define BUTTON_TIMEOUT_S_DEFAULT 300.0f
 #define DISARM_S_DEFAULT         60.0f
@@ -131,12 +130,24 @@ static void button_led (uint32_t val)
     }
 }
 
-static bool button_pressed (int fd)
+/* One reading of the switches for the arm wait. A press only counts with
+ * the lid closed and the interlock loop closed - the same condition under
+ * which the hardware button latch would clear on it. */
+enum { Arm_Waiting = 0, Arm_Pressed, Arm_LidOpen, Arm_InterlockOpen };
+
+static int arm_switches (void)
 {
-    uint8_t sw[2] = {0};
-    if(fd < 0 || ioctl(fd, EVIOCGSW(sizeof(sw)), sw) < 0)
-        return false;
-    return !!(sw[SW_BIT_BUTTON / 8] & (1u << (SW_BIT_BUTTON % 8)));
+    uint8_t sw[SW_BYTES];
+
+    if(!gfsw_read_raw(sw))
+        return Arm_Waiting;             /* unreadable: keep waiting */
+
+    if(!gfsw_bit_set(sw, SW_BIT_DOORS))
+        return Arm_LidOpen;
+    if(gfsw_bit_set(sw, SW_BIT_INTERLOCK))
+        return Arm_InterlockOpen;
+
+    return gfsw_bit_set(sw, SW_BIT_BUTTON) ? Arm_Pressed : Arm_Waiting;
 }
 
 /* Pump the protocol while blocked in the button wait (same pattern as
@@ -202,7 +213,7 @@ static bool gflaser_arm (void)
     gfcool_laser_armed(true);
     latch_lock(false);
 
-    if(hw_active) {
+    if(gfsw_available()) {
         /* The wait runs with the latch unlocked, so it must always be
          * bounded: out-of-range values (including 0 and garbage that
          * parses negative or NaN) fall back to the default. */
@@ -210,26 +221,42 @@ static bool gflaser_arm (void)
         if(!(timeout_s >= 1.0f && timeout_s <= 3600.0f))
             timeout_s = BUTTON_TIMEOUT_S_DEFAULT;
         double deadline = wall_s() + (double)timeout_s;
-        int fd = open(SWITCH_DEV, O_RDONLY | O_NONBLOCK);
 
         button_led(255);
         report_message("press the button to start the laser job", Message_Info);
 
+        /* The lid and the interlock loop are checked here explicitly:
+         * the wait runs at Idle, where the door signal is hidden from
+         * the core, and an open lid or loop cancels the job outright
+         * (the factory does the same; the hardware button latch sets on
+         * the lid and would ignore a press anyway). */
         bool pressed = false, aborted = false;
         while(!pressed && !aborted) {
-            pressed = button_pressed(fd);
-            if(!pressed) {
-                if(!pump(50000))
-                    aborted = true;             /* soft reset during the wait */
-                else if(wall_s() > deadline) {
-                    report_message("laser arm timed out waiting for the button", Message_Warning);
+            switch(arm_switches()) {
+                case Arm_Pressed:
+                    pressed = true;
+                    break;
+                case Arm_LidOpen:
+                    report_message("lid opened during arm - job cancelled", Message_Warning);
                     system_raise_alarm(Alarm_AbortCycle);
                     aborted = true;
-                }
+                    break;
+                case Arm_InterlockOpen:
+                    report_message("interlock open during arm - job cancelled", Message_Warning);
+                    system_raise_alarm(Alarm_AbortCycle);
+                    aborted = true;
+                    break;
+                default:
+                    if(!pump(50000))
+                        aborted = true;             /* soft reset during the wait */
+                    else if(wall_s() > deadline) {
+                        report_message("laser arm timed out waiting for the button", Message_Warning);
+                        system_raise_alarm(Alarm_AbortCycle);
+                        aborted = true;
+                    }
+                    break;
             }
         }
-        if(fd >= 0)
-            close(fd);
         button_led(0);
 
         if(aborted) {
