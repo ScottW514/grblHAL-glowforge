@@ -82,7 +82,11 @@ float gfio_conf_read_float(const char *k, float fb) { (void)k; return fb; }
 void serial_poll(void) {}
 void serial_wait(long us) { (void)us; }
 unsigned serial_client_generation(void) { return 1; }
-bool protocol_execute_realtime(void) { return true; }
+static int resets_requested;
+bool protocol_enqueue_realtime_command(uint8_t c) { if (c == 0x18) resets_requested++; return true; }
+/* The reset lands in the next pump: protocol_execute_realtime() returns
+   false (aborting) once a reset has been requested. */
+bool protocol_execute_realtime(void) { return resets_requested == 0; }
 
 /* --- driver source under test ---------------------------------------- */
 #include "../src/glowforge_laser.c"
@@ -117,6 +121,7 @@ static void reset_state(void)
 {
     fire_ok_calls = 0;
     alarms_raised = 0;
+    resets_requested = 0;
     last_message[0] = '\0';
     stream_armed = false;
     latch_locked_last = true;
@@ -205,7 +210,7 @@ int main(void)
     CHECK(!armed_e, "lid open during the wait refuses");
     CHECK(!laser_ok && !stream_armed, "armed window never opens on a lid open");
     CHECK(latch_locked_last, "latch relocked on the lid open");
-    CHECK(alarms_raised == 1, "alarm raised on the lid open");
+    CHECK(resets_requested == 1 && alarms_raised == 0, "lid open cancels with a soft reset, not an alarm");
     CHECK(strstr(last_message, "lid opened") != NULL, "reports the lid as the reason");
     CHECK(fire_ok_calls == 1, "the post-wait coolant check is not reached");
 
@@ -225,7 +230,7 @@ int main(void)
     bool armed_g = gflaser_arm();
     CHECK(!armed_g, "interlock open during the wait refuses");
     CHECK(!laser_ok && latch_locked_last, "interlock open leaves the latch locked");
-    CHECK(alarms_raised == 1, "alarm raised on the interlock open");
+    CHECK(resets_requested == 1 && alarms_raised == 0, "interlock open cancels with a soft reset, not an alarm");
     CHECK(strstr(last_message, "interlock") != NULL, "reports the interlock as the reason");
 
     printf(failures ? "FAIL: %d check(s) failed\n"

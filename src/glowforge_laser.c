@@ -244,15 +244,20 @@ static bool gflaser_arm (void)
                     pressed = true;
                     gfsw_button_consumed();   /* not a pause press */
                     break;
+                /* Lid or loop open: the job is cancelled the way a mid-job
+                 * open cancels it - a soft reset from a standstill (the
+                 * position is kept, no alarm), so the sender's stream ends
+                 * on the banner and nothing needs unlocking afterward. The
+                 * reset lands in the pump below, which then returns false. */
                 case Arm_LidOpen:
                     report_message("lid opened during arm - job cancelled", Message_Warning);
-                    system_raise_alarm(Alarm_AbortCycle);
-                    aborted = true;
+                    protocol_enqueue_realtime_command(CMD_RESET);
+                    aborted = !pump(50000);
                     break;
                 case Arm_InterlockOpen:
                     report_message("interlock open during arm - job cancelled", Message_Warning);
-                    system_raise_alarm(Alarm_AbortCycle);
-                    aborted = true;
+                    protocol_enqueue_realtime_command(CMD_RESET);
+                    aborted = !pump(50000);
                     break;
                 default:
                     if(!pump(50000))
