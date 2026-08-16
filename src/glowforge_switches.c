@@ -133,6 +133,7 @@ static enum {
 static bool door_hidden;                   /* hide the door through reset + park */
 static double park_at;                     /* wall time the park was enqueued / retried from */
 static bool park_saw_cycle;
+static bool hold_seen;                     /* lid_policy=hold: parked, policy already read */
 static bool have_job_start;
 static float job_start[N_AXIS];            /* machine position when the job began */
 static sys_state_t prev_state = STATE_IDLE;
@@ -327,8 +328,18 @@ static void cancel_poll (sys_state_t st)
     switch(cancel_state) {
 
         case Cancel_None:
-            if(door_parked(st) && lid_cancels())
-                cancel_job();
+            /* The policy is read once per door event, when the job has
+               just parked; under "hold" it then stays parked (stock
+               behavior) without re-reading the config every pass. */
+            if(door_parked(st)) {
+                if(!hold_seen) {
+                    if(lid_cancels())
+                        cancel_job();
+                    else
+                        hold_seen = true;
+                }
+            } else
+                hold_seen = false;
             break;
 
         case Cancel_ResetSent:
