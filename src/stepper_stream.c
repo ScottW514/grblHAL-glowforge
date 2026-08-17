@@ -69,6 +69,7 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -105,8 +106,32 @@
 
 /* Producer pacing: run interrupt callbacks while virtual time is less than
  * wall + SLACK; sleep in PACE_SLICE steps while ahead. */
-#define PACE_SLACK_S 0.002
 #define PACE_SLICE_NS 1000000   /* 1 ms */
+
+/* Producer lead: how far ahead of wall clock virtual time may run, and so
+ * the whole margin absorbing a scheduling stall. The queue depth does NOT
+ * contribute to it - the shipper's due index carries the same + gf.depth
+ * the producer's base starts at, so the two cancel and this is the only
+ * slack there is. A stall longer than the lead maps events behind the ship
+ * cursor, where they clamp forward into step bursts.
+ *
+ * Producing further ahead costs nothing on the safing path: unshipped bytes
+ * live in the userspace ring and gf_stream_reset discards them (with their
+ * laser transitions) on abort, so the FIRE tail is unchanged. It does defer
+ * a feed hold by up to the lead, on top of the queue depth already in the
+ * kernel - motion responsiveness, not emission.
+ *
+ * The ceiling is the cycle-churn path, not capacity or safety. gf_stream_wakeup
+ * only re-bases production onto the wall cursor when the cursor has passed it
+ * (due_now > produced); a lead large enough to keep production ahead of the
+ * cursor across an idle gap skips that re-base, so the overshoot survives the
+ * cycle and accumulates as dark pad bytes. Measured on the churn harness: 2 and
+ * 10 ms both give an identical 64790-byte stream, 15 ms and above inflate it to
+ * ~225k and stop being deterministic. Raising this past 10 ms needs the re-base
+ * to reclaim the overshoot first. */
+#define GFSINK_LEAD_MS_DEFAULT 10
+#define GFSINK_LEAD_MS_MIN 2
+#define GFSINK_LEAD_MS_MAX 200
 
 /* Soft real time for the two threads whose wakeup latency IS step timing.
  * The shipper sits above the producer because its writes carry a hard
@@ -150,6 +175,9 @@ static struct {
     int dump_fd;              /* GFSINK_DUMP: copy of the shipped stream */
     uint32_t rate;            /* machine tick = kernel step_freq */
     uint32_t depth;           /* preload/queue depth in bytes (ticks) */
+    double lead_s;            /* producer lead over wall clock, seconds */
+    int64_t min_margin;       /* closest any event came to the ship cursor,
+                               * in bytes, this run; negative means clamped */
 
     pthread_mutex_t lock;     /* guards everything below (lock order: core -> gf) */
     unsigned char ring[RING_SIZE];
@@ -325,6 +353,12 @@ void gf_stream_pulse (uint8_t step_bits, uint8_t dir_bits)
     pthread_mutex_lock(&gf.lock);
     if(gf.streaming) {
         uint64_t idx = gf.base + gf.vticks / VTICKS_PER_BYTE;
+        /* How close this event came to the ship cursor, before any
+         * correction: the real headroom, measured rather than derived from
+         * the pacing constants. Negative means the lead was exhausted. */
+        int64_t margin = (int64_t)idx - (int64_t)gf.shipped;
+        if(margin < gf.min_margin)
+            gf.min_margin = margin;
         if(idx < gf.shipped) {          /* produced late vs wall clock: push forward */
             idx = gf.shipped;
             gf.clamped++;
@@ -519,6 +553,7 @@ static void *producer_thread (void *arg)
 
         pthread_mutex_lock(&gf.lock);
         uint64_t clamped0 = gf.clamped;
+        gf.min_margin = INT64_MAX;
         pthread_mutex_unlock(&gf.lock);
 
         while(armed && !quit) {
@@ -548,11 +583,11 @@ static void *producer_thread (void *arg)
              * wakeup epoch. Sleeps are sliced so disarm is noticed fast
              * even inside a multi-second G4 tick. Yield when running flat
              * out so the protocol thread gets lock windows (single core). */
-            if(vtime > (wall_s() - epoch) + PACE_SLACK_S) {
+            if(vtime > (wall_s() - epoch) + gf.lead_s) {
                 do {
                     slept++;
                     sleep_ns(PACE_SLICE_NS);
-                } while(armed && !quit && vtime > (wall_s() - epoch) + PACE_SLACK_S);
+                } while(armed && !quit && vtime > (wall_s() - epoch) + gf.lead_s);
             } else
                 sched_yield();
         }
@@ -560,20 +595,29 @@ static void *producer_thread (void *arg)
         if(n_calls) {
             pthread_mutex_lock(&gf.lock);
             uint64_t clamped_run = gf.clamped - clamped0;
+            int64_t margin = gf.min_margin;
             pthread_mutex_unlock(&gf.lock);
+            /* The margin is what the lead is actually worth on this machine:
+             * bytes between the latest event and the ship cursor at the
+             * worst moment of the run. Reported in ms of stream time so it
+             * compares directly against the lead. */
+            double margin_ms = margin == INT64_MAX ? 0.0
+                             : (double)margin * 1e3 / (double)gf.rate;
             fflog(LOG_DEBUG, "gfstream: run: %llu callbacks in %.3f s (%.1f us/call incl. pacing), "
-                  "%llu pace sleeps, max behind %.1f ms, clamped %llu",
+                  "%llu pace sleeps, max behind %.1f ms, min margin %.1f ms of %.0f, clamped %llu",
                   (unsigned long long)n_calls, wall_s() - t_run,
                   (wall_s() - t_run) * 1e6 / (double)n_calls,
                   (unsigned long long)slept, max_behind * 1e3,
+                  margin_ms, gf.lead_s * 1e3,
                   (unsigned long long)clamped_run);
             /* Clamping corrupts step timing while the ring stays fed, so
              * cnc/underruns reads 0 through it: without this line the
              * condition is invisible at the default level. */
             if(clamped_run)
                 fflog(LOG_WARNING, "gfstream: run: %llu late events clamped "
-                      "(max behind %.1f ms) - step generation was starved of CPU",
-                      (unsigned long long)clamped_run, max_behind * 1e3);
+                      "(max behind %.1f ms, lead %.0f ms) - step generation was "
+                      "starved of CPU", (unsigned long long)clamped_run,
+                      max_behind * 1e3, gf.lead_s * 1e3);
         }
     }
 
@@ -1137,6 +1181,20 @@ void gf_stream_init (void)
     }
     gf.depth = (uint32_t)((uint64_t)gf.rate * depth_ms / 1000);
 
+    /* Producer lead. Tunable so the bench can sweep it against the measured
+     * min margin without a rebuild; the ring holds seconds, so the ceiling
+     * is about feed-hold responsiveness, not capacity. */
+    uint32_t lead_ms = GFSINK_LEAD_MS_DEFAULT;
+    if((opt = getenv("GFSINK_LEAD_MS")) && *opt) {
+        long v = strtol(opt, NULL, 10);
+        if(v >= GFSINK_LEAD_MS_MIN && v <= GFSINK_LEAD_MS_MAX)
+            lead_ms = (uint32_t)v;
+        else
+            fflog(LOG_WARNING, "gfstream: GFSINK_LEAD_MS '%s' out of range (%u-%u); using %u",
+                  opt, GFSINK_LEAD_MS_MIN, GFSINK_LEAD_MS_MAX, GFSINK_LEAD_MS_DEFAULT);
+    }
+    gf.lead_s = (double)lead_ms / 1000.0;
+
     /* Bench/debug: mirror every shipped byte to a file for offline
      * stream inspection (works in null-sink mode too). */
     if((opt = getenv("GFSINK_DUMP")) && *opt)
@@ -1184,8 +1242,8 @@ void gf_stream_init (void)
     gf.threads_started = true;
 
     atexit(gf_stream_shutdown);
-    fflog(LOG_INFO, "gfstream: %s, %u Hz machine tick, %u ms depth",
-          gf.active ? dev : "null-sink (no GFSINK)", gf.rate, depth_ms);
+    fflog(LOG_INFO, "gfstream: %s, %u Hz machine tick, %u ms depth, %u ms producer lead",
+          gf.active ? dev : "null-sink (no GFSINK)", gf.rate, depth_ms, lead_ms);
 }
 
 void gf_stream_shutdown (void)
