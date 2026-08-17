@@ -48,6 +48,17 @@
 // the kernel laser latch) and the hardware safety chain.
 #define DEFAULT_LASER_MODE On
 
+// The tube has a wide dead band at the bottom of the duty range: the
+// discharge strikes at about 3 % and draws current from there up, but
+// no sustained light comes out below ~16 % of the 127-count period
+// (PWMSAR 20), so power commanded into that band marks nothing. $35
+// floors every nonzero S at the lowest duty that lases, which is what
+// keeps M4's velocity-scaled power out of the dead band at corners,
+// reversals and short segments. The floor is a tube property, so it is
+// commissioned per machine (the ladder drill in forgefirm
+// scripts/bench/live_fire_drills.py measures it).
+#define DEFAULT_SPINDLE_PWM_MIN_VALUE 16.0f // Percent of full duty
+
 // The machine has no limit or home switches; the operator selects the
 // homing method at runtime (homing_mode in /data/forgefirm.conf, set
 // from the forgectrl web UI - see glowforge_homing.c):
