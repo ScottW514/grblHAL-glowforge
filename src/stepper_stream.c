@@ -108,6 +108,13 @@
 #define PACE_SLACK_S 0.002
 #define PACE_SLICE_NS 1000000   /* 1 ms */
 
+/* Soft real time for the two threads whose wakeup latency IS step timing.
+ * The shipper sits above the producer because its writes carry a hard
+ * deadline, while the producer can absorb a little jitter against the
+ * queue depth. Both fall back to normal scheduling without privileges. */
+#define SCHED_PRIO_SHIPPER 10
+#define SCHED_PRIO_PRODUCER 9
+
 /* Shipper cadence. */
 #define SHIP_PERIOD_NS 10000000 /* 10 ms */
 
@@ -487,6 +494,17 @@ static void *producer_thread (void *arg)
 {
     (void)arg;
 
+    /* This thread advances virtual time, so its wakeup latency IS step
+     * timing: every interval it is kept off the CPU is an interval the
+     * grid does not advance, and the events that follow map behind the
+     * ship cursor and clamp forward into step bursts. It paces itself
+     * with timed sleeps and is blocked for most of a run, so it does not
+     * crowd the protocol thread; the kernel's RT throttle bounds the
+     * flat-out catch-up path. Fall back silently without privileges. */
+    struct sched_param sp = { .sched_priority = SCHED_PRIO_PRODUCER };
+    if(pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
+        rt_log("gfstream: producer SCHED_FIFO unavailable, using default scheduling\n");
+
     for(;;) {
         pthread_mutex_lock(&gf.wake_mx);
         while(!armed && !quit)
@@ -549,6 +567,13 @@ static void *producer_thread (void *arg)
                   (wall_s() - t_run) * 1e6 / (double)n_calls,
                   (unsigned long long)slept, max_behind * 1e3,
                   (unsigned long long)clamped_run);
+            /* Clamping corrupts step timing while the ring stays fed, so
+             * cnc/underruns reads 0 through it: without this line the
+             * condition is invisible at the default level. */
+            if(clamped_run)
+                fflog(LOG_WARNING, "gfstream: run: %llu late events clamped "
+                      "(max behind %.1f ms) - step generation was starved of CPU",
+                      (unsigned long long)clamped_run, max_behind * 1e3);
         }
     }
 
@@ -872,9 +897,9 @@ static void *shipper_thread (void *arg)
 
     /* Soft real time for the feeder per the UAPI recommendation; fall back
      * silently to normal scheduling without privileges. */
-    struct sched_param sp = { .sched_priority = 10 };
+    struct sched_param sp = { .sched_priority = SCHED_PRIO_SHIPPER };
     if(pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
-        rt_log("gfstream: SCHED_FIFO unavailable, using default scheduling\n");
+        rt_log("gfstream: shipper SCHED_FIFO unavailable, using default scheduling\n");
 
     while(!quit) {
         ship_pass();

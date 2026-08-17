@@ -61,6 +61,22 @@ static bool exit_reset_sent = false;
 static void (*volatile delay_callback)(void) = NULL;
 static volatile uint32_t delay_deadline_ms;
 
+/* The stream's producer and shipper both hold this against the protocol
+ * thread on a uniprocessor, and both run SCHED_FIFO: priority inheritance
+ * is what bounds the inversion when a preempted normal-priority holder
+ * would otherwise block them. Rebuilt while main is still the only
+ * thread, so no user of the lock can be mid-acquire. */
+void gf_core_lock_init (void)
+{
+    pthread_mutexattr_t ma;
+    pthread_mutexattr_init(&ma);
+    pthread_mutexattr_settype(&ma, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutexattr_setprotocol(&ma, PTHREAD_PRIO_INHERIT);
+    pthread_mutex_destroy(&core_mx);
+    pthread_mutex_init(&core_mx, &ma);
+    pthread_mutexattr_destroy(&ma);
+}
+
 void gf_core_lock (void)
 {
     pthread_mutex_lock(&core_mx);
@@ -345,6 +361,7 @@ bool driver_setup (settings_t *settings)
 
 bool driver_init (void)
 {
+    gf_core_lock_init();        /* before gf_stream_init starts its threads */
     gf_stream_init();
     gfcool_init();
     gfhome_init();

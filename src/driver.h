@@ -11,6 +11,7 @@
 // hal.irq_disable/irq_enable map to it, the atomics helpers take it, and
 // the stepper producer thread holds it around every core stepper
 // interrupt callback. Lock order: core lock -> gf stream lock.
+void gf_core_lock_init (void);
 void gf_core_lock (void);
 void gf_core_unlock (void);
 
