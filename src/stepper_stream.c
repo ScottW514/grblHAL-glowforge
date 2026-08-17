@@ -151,6 +151,10 @@ static struct {
     uint64_t base;            /* stream index of the current wakeup's epoch */
     bool streaming;           /* motion in progress (wake_up .. go_idle) */
     bool kernel_running;      /* we believe a kernel run is active */
+    bool run_pending;         /* bytes shipped, run refused (kernel busy):
+                                 re-issue once the kernel is idle */
+    bool clear_pending;       /* a reset stopped the kernel mid-motion: drop
+                                 its unplayed residue once it is idle */
     bool hold_pending;        /* drop to hold currents once kernel idles */
     double hold_poll_at;      /* wall time of the next kernel-state poll */
     _Atomic bool failed;      /* unrecoverable; stop feeding (read lock-free
@@ -554,9 +558,138 @@ static void *producer_thread (void *arg)
 /* --- shipper thread ------------------------------------------------------ */
 
 /* Ship due bytes. Returns with gf.lock released. */
+/* Start a kernel run on the bytes shipped so far. Returns 1 when the run
+ * is playing (or a stalled one was recovered), 0 when the kernel is busy
+ * (still draining a previous stream, or decelerating from a stop) - the
+ * caller keeps the request pending and re-issues it once the kernel is
+ * idle - 2 when the kernel is idle with nothing queued (everything was
+ * already consumed), and -1 on a fault (flagged). Called without gf.lock. */
+static int issue_run (void)
+{
+    char state[16] = "";
+    int rc = 1;
+
+    /* The kernel parks the FIRE line Hi-Z at every run end (its
+     * laser-safe stop) and only a latch-unlock write restores SDMA
+     * drive - the factory flow re-unlocks before every run. An
+     * armed window spanning kernel runs must do the same, or the
+     * next run's fire bits play into a tri-stated pin. The armed
+     * check and the unlock are made atomic against a concurrent
+     * disarm by latch_mx (see gf_stream_laser_latch). */
+    pthread_mutex_lock(&latch_mx);
+    bool relight = laser_armed;
+    if(relight)
+        gfio_wr_attr("cnc/laser_latch", "0");
+    if(gfio_wr_attr("cnc/run", "1") != 0) {
+        int err = errno;
+        gfio_rd_attr("cnc/state", state, sizeof(state));
+        if(strcmp(state, "underrun") == 0 && !laser_armed) {
+            /* Late detection of a starve: ack, then retry once. The
+             * counters no longer prove position, so the homing
+             * anchor must not survive the retry. */
+            rt_log("gfstream: kernel underrun; recovering - "
+                   "position untrusted, re-home before an armed job\n");
+            gfhome_invalidate();
+            gfio_wr_attr("cnc/stop", "1");
+            gfio_wr_attr("cnc/run", "1");
+        } else if(strcmp(state, "underrun") == 0) {
+            /* Laser armed: a restarted run resets the hardware duty,
+             * so replaying the queued bytes could fire remaining
+             * fire bits at ~full power. Ack the underrun and fail
+             * safe instead; the alarm path relocks the latch. */
+            rt_log("gfstream: kernel underrun while laser armed - failing safe\n");
+            gfio_wr_attr("cnc/stop", "1");
+            gf.failed = true;
+            fault_flag = true;
+            rc = -1;
+        } else if(strcmp(state, "running") == 0) {
+            /* Busy: the kernel is still playing the previous stream's
+             * tail or decelerating from a stop. If it is still consuming
+             * the ring, the bytes just written play as a continuation;
+             * if it has already hit its end of data (or is stopping),
+             * they wait in the ring for a run that nobody would issue -
+             * and would replay at the start of the NEXT run instead.
+             * Never assume: keep the request pending and re-issue it the
+             * moment the kernel reads idle. */
+            rc = 0;
+        } else if(strcmp(state, "idle") == 0 && err == ENODATA) {
+            rc = 2;                     /* nothing queued: already consumed */
+        } else {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "gfstream: run refused (state=%s)\n", state);
+            rt_log(msg);
+            gf.failed = true;
+            fault_flag = true;
+            rc = -1;
+        }
+    }
+    if(relight && !laser_armed)
+        gfio_wr_attr("cnc/laser_latch", "1");  /* disarmed meanwhile - relock */
+    pthread_mutex_unlock(&latch_mx);
+
+    return rc;
+}
+
+/* Kernel-side follow-ups on the shipper's cadence: a run request the busy
+ * kernel refused is re-issued once it is idle, and a mid-motion reset's
+ * unplayed residue is dropped once the stop has played out. Both hold
+ * shipping until resolved (a clear must not eat a new job's bytes).
+ * Returns false when shipping must wait. */
+static bool pending_pass (void)
+{
+    pthread_mutex_lock(&gf.lock);
+    bool clear = gf.clear_pending, run = gf.run_pending, active = gf.active;
+    pthread_mutex_unlock(&gf.lock);
+
+    if(!active || (!clear && !run))
+        return true;
+
+    char state[16] = "";
+    if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0)
+        return !clear;
+    if(strcmp(state, "running") == 0)
+        return !clear;                  /* still playing: wait */
+
+    if(clear) {
+        /* Idle after the stop: whatever the ramp did not reach is stale
+         * motion (and stale fire bits) that must never replay. */
+        if(lseek(gf.fd, 1, SEEK_SET) < 0)
+            rt_log("gfstream: could not clear the kernel residue after the reset\n");
+        pthread_mutex_lock(&gf.lock);
+        gf.clear_pending = false;
+        gf.run_pending = false;
+        gf.kernel_running = false;
+        gf.power_sent = false;
+        pthread_mutex_unlock(&gf.lock);
+        return true;
+    }
+
+    /* Idle with our request pending: either the bytes we shipped were
+     * consumed as a continuation (nothing left: run says no data) or they
+     * were stranded and start now. */
+    int rc = issue_run();
+    pthread_mutex_lock(&gf.lock);
+    if(rc == 1) {
+        rt_log("gfstream: deferred run started (kernel was busy at the request)\n");
+        gf.run_pending = false;
+        gf.kernel_running = true;
+    } else if(rc == 0) {
+        /* raced back into running: keep waiting */
+    } else {
+        gf.run_pending = false;
+        gf.kernel_running = false;
+    }
+    pthread_mutex_unlock(&gf.lock);
+    return true;
+}
+
 static void ship_pass (void)
 {
     static unsigned char chunk[SHIP_CHUNK];
+
+    /* A deferred run or a residue clear first; a clear holds shipping. */
+    if(!pending_pass())
+        return;
 
     pthread_mutex_lock(&gf.lock);
 
@@ -683,49 +816,22 @@ static void ship_pass (void)
     pthread_mutex_unlock(&gf.lock);
 
     if(start_run && gf.active && !gf.failed) {
-        char state[16] = "";
-        /* The kernel parks the FIRE line Hi-Z at every run end (its
-         * laser-safe stop) and only a latch-unlock write restores SDMA
-         * drive - the factory flow re-unlocks before every run. An
-         * armed window spanning kernel runs must do the same, or the
-         * next run's fire bits play into a tri-stated pin. The armed
-         * check and the unlock are made atomic against a concurrent
-         * disarm by latch_mx (see gf_stream_laser_latch). */
-        pthread_mutex_lock(&latch_mx);
-        bool relight = laser_armed;
-        if(relight)
-            gfio_wr_attr("cnc/laser_latch", "0");
-        if(gfio_wr_attr("cnc/run", "1") != 0) {
-            gfio_rd_attr("cnc/state", state, sizeof(state));
-            if(strcmp(state, "underrun") == 0 && !laser_armed) {
-                /* Late detection of a starve: ack, then retry once. The
-                 * counters no longer prove position, so the homing
-                 * anchor must not survive the retry. */
-                rt_log("gfstream: kernel underrun; recovering - "
-                       "position untrusted, re-home before an armed job\n");
-                gfhome_invalidate();
-                gfio_wr_attr("cnc/stop", "1");
-                gfio_wr_attr("cnc/run", "1");
-            } else if(strcmp(state, "underrun") == 0) {
-                /* Laser armed: a restarted run resets the hardware duty,
-                 * so replaying the queued bytes could fire remaining
-                 * fire bits at ~full power. Ack the underrun and fail
-                 * safe instead; the alarm path relocks the latch. */
-                rt_log("gfstream: kernel underrun while laser armed - failing safe\n");
-                gfio_wr_attr("cnc/stop", "1");
-                gf.failed = true;
-                fault_flag = true;
-            } else if(strcmp(state, "running") != 0) {
-                char msg[64];
-                snprintf(msg, sizeof(msg), "gfstream: run refused (state=%s)\n", state);
-                rt_log(msg);
-                gf.failed = true;
-                fault_flag = true;
-            }
+        int rc = issue_run();
+        if(rc == 0) {
+            /* Busy kernel: keep the request pending (pending_pass re-issues
+             * it once the kernel is idle). kernel_running stays set: the
+             * shipped bytes are the kernel's now, one way or the other. */
+            pthread_mutex_lock(&gf.lock);
+            gf.run_pending = true;
+            pthread_mutex_unlock(&gf.lock);
+        } else if(rc == 2) {
+            /* Idle with nothing queued right after a write: the ring was
+             * cleared under us; the stream restarts on the next ship. */
+            pthread_mutex_lock(&gf.lock);
+            gf.kernel_running = false;
+            gf.power_sent = false;
+            pthread_mutex_unlock(&gf.lock);
         }
-        if(relight && !laser_armed)
-            gfio_wr_attr("cnc/laser_latch", "1");  /* disarmed meanwhile - relock */
-        pthread_mutex_unlock(&latch_mx);
     }
 }
 
@@ -783,25 +889,40 @@ static void *shipper_thread (void *arg)
 
 void gf_stream_reset (void)
 {
-    /* Soft reset mid-motion: the core has already declared position lost
-     * and gone idle without producing a decel. Drop the unshipped backlog
-     * and let the KERNEL decelerate (cnc/stop ramps down at ramp_rate), so
-     * nothing slams mechanically. */
+    /* Soft reset. Two cases:
+     * - mid-motion (the stream is live): the core has declared position
+     *   lost and gone idle without producing a decel. Drop the unshipped
+     *   backlog and let the KERNEL decelerate (cnc/stop ramps down at
+     *   ramp_rate), so nothing slams mechanically. The bytes already
+     *   shipped that the ramp does not reach stay queued in the kernel
+     *   ring and would replay at the start of the NEXT run - stale motion
+     *   in an old direction; they are cleared once the kernel is idle
+     *   (the position is lost anyway; see ship_pass).
+     * - the stream had already ended (go_idle ran) and the kernel is only
+     *   draining its completed queue: leave it. That queue is the tail of
+     *   motion the core has counted; a stop here would strand it (to
+     *   replay later) or lose it, and the shipper's end-of-stream logic
+     *   finishes as it always does. */
     pthread_mutex_lock(&gf.lock);
-    gf.produced = gf.shipped;
-    gf.streaming = false;
-    gf.lev_head = gf.lev_tail;   /* unshipped laser transitions die with the backlog */
-    gf.cur_fire = false;
-    gf.power_sent = false;
-    if(gf.kernel_running) {
-        if(gf.active) {
-            gfio_wr_attr("cnc/stop", "1");
-            gfio_wr_attr("cnc/streaming", "0");
+    if(gf.streaming) {
+        gf.produced = gf.shipped;
+        gf.streaming = false;
+        gf.lev_head = gf.lev_tail;   /* unshipped laser transitions die with the backlog */
+        gf.cur_fire = false;
+        gf.power_sent = false;
+        if(gf.kernel_running) {
+            if(gf.active) {
+                gfio_wr_attr("cnc/stop", "1");
+                gfio_wr_attr("cnc/streaming", "0");
+            }
+            gf.kernel_running = false;
+            gf.run_pending = false;
+            gf.clear_pending = true;
+            gf.hold_pending = true;
+            gf.hold_poll_at = wall_s() + 0.2;
         }
-        gf.kernel_running = false;
-        gf.hold_pending = true;
-        gf.hold_poll_at = wall_s() + 0.2;
     }
+    /* else: the completed stream's tail keeps shipping and draining. */
     pthread_mutex_unlock(&gf.lock);
 }
 
@@ -826,7 +947,10 @@ bool gf_stream_suspend (void)
     bool idle, drop_hold = false;
 
     pthread_mutex_lock(&gf.lock);
-    idle = !gf.streaming && !gf.kernel_running && gf.produced == gf.shipped;
+    /* A pending residue clear must land before the device changes hands:
+     * stale bytes would replay in the other holder's first run. */
+    idle = !gf.streaming && !gf.kernel_running && !gf.clear_pending &&
+            gf.produced == gf.shipped;
     if(idle) {
         /* The kernel may still be playing out its queue (the decel tail
          * lives there); closing a flock'd fd mid-program is an emergency

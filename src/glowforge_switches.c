@@ -116,6 +116,7 @@
 /* Give the return-to-start park a moment to be accepted / to start. */
 #define PARK_ENQUEUE_RETRY_S   2.0
 #define PARK_ZERO_LENGTH_S     1.0
+#define DRAIN_WAIT_S           2.0   /* kernel drain of the hold tail (~depth) */
 
 static int sw_fd = -1;
 static const char *fake_path;              /* GF_SWITCH_FILE (host tests) */
@@ -127,6 +128,7 @@ static bool button_prev;                   /* button level at the previous poll 
 /* The cancel policy's state (see the file header). */
 static enum {
     Cancel_None = 0,       /* nothing pending */
+    Cancel_WaitDrain,      /* job cancelled; the kernel drains the hold tail, then reset */
     Cancel_ResetSent,      /* job cancelled, soft reset queued; wait for Idle */
     Cancel_ParkQueued      /* return-to-start motion enqueued; wait for it to end */
 } cancel_state = Cancel_None;
@@ -314,12 +316,30 @@ static void cancel_job (void)
     /* Hide the door from here on: the reset's re-init and the park must
        not see it. Cleared when the park has ended. */
     door_hidden = true;
+    cancel_state = Cancel_WaitDrain;
+    park_at = wall_s();
+}
+
+/* The kernel is still playing the queued tail of the hold's deceleration
+   for up to a stream depth after the core parks; the reset waits for it
+   (bounded), so nothing stops it short and the park runs on an idle
+   kernel. Without a device (null-sink) there is nothing to wait for. */
+static bool kernel_idle (void)
+{
+    char state[16] = "";
+    if(gfio_rd_attr("cnc/state", state, sizeof(state)) != 0)
+        return true;
+    return strcmp(state, "idle") == 0;
+}
+
+static void send_reset (void)
+{
     cancel_state = Cancel_ResetSent;
     park_at = wall_s();
-
-    /* A soft reset from a fully parked door: no motion is in flight, so
-       the core keeps the position (no alarm 3); the sender's stream is
-       flushed and it sees the reset banner - the job is over for it. */
+    /* A soft reset from a fully parked door with the kernel idle: no
+       motion is in flight, so the core keeps the position (no alarm 3);
+       the sender's stream is flushed and it sees the reset banner - the
+       job is over for it. */
     protocol_enqueue_realtime_command(CMD_RESET);
 }
 
@@ -340,6 +360,14 @@ static void cancel_poll (sys_state_t st)
                 }
             } else
                 hold_seen = false;
+            break;
+
+        case Cancel_WaitDrain:
+            /* Idle kernel, the bounded wait, or the core leaving the door
+               state under us (a cycle start; the latch is already locked):
+               the job is cancelled either way - reset now. */
+            if(kernel_idle() || st != STATE_SAFETY_DOOR || wall_s() - park_at > DRAIN_WAIT_S)
+                send_reset();
             break;
 
         case Cancel_ResetSent:
