@@ -186,7 +186,9 @@ int main(void)
     CHECK(armed_b, "arms when the gate is clear at both checks");
     CHECK(laser_ok, "armed window opens when clear");
     CHECK(stream_armed, "stream is told armed when clear");
-    CHECK(dose_period_last == 0, "no laser_power_model key selects the analog dose model");
+    /* Density is the shipped default: with no laser_power_model key the
+     * arm selects it, and passes the base period rather than 0. */
+    CHECK(dose_period_last == 20, "no laser_power_model key selects the density dose model");
 
     /* Case C - blocked at the pre-wait check: refuses before arming. */
     reset_state();

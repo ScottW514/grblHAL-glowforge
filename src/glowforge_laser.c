@@ -52,12 +52,13 @@
     laser_disarm_s           spindle-off grace before the armed window
                              closes (default 60)
     laser_power_model        density (dose as FIRE-bit density at full
-                             duty) or analog (dose as PWM duty, the
-                             default). Density wants $35 = 0: the floor
-                             exists only because an analog duty cannot
-                             go low without leaving the lasing band, and
-                             it clamps the light end of the density
-                             range for no gain.
+                             duty, the default) or analog (dose as PWM
+                             duty). $35 means a different thing in each:
+                             a density floor for the first, a duty floor
+                             for the second, and the shipped default is
+                             the density one - selecting analog means
+                             raising $35 to the duty the tube lases at
+                             or low S will not fire.
     laser_pulse_ticks        density base period in machine ticks
                              (default 20 = 710 us at 28160 Hz)
     laser_pulse_min_ticks    shortest pulse the density model will emit
@@ -121,6 +122,11 @@
  * period is skipped and its debt carried, so a low level arrives as
  * fewer full-width pulses rather than stubs. */
 #define PULSE_MIN_TICKS_DEFAULT 3.0f
+
+/* The duty the tube lases at, for the analog fallback: $35 below this
+ * puts low S into the dead band. The shipped $35 is the DENSITY floor
+ * (boards/glowforge.h), so selecting the analog model means raising it. */
+#define ANALOG_FLOOR_PCT 16.0f
 #define POWER_MODEL_KEY "laser_power_model"
 #define PULSE_TICKS_KEY "laser_pulse_ticks"
 #define PULSE_MIN_KEY   "laser_pulse_min_ticks"
@@ -328,8 +334,9 @@ static bool gflaser_arm (void)
     /* Select the dose model for this window, before any fire reaches
      * the stream. */
     char model[16] = "";
-    bool density = gfio_conf_read(POWER_MODEL_KEY, model, sizeof(model)) == 0 &&
-                    strcmp(model, "density") == 0;
+    bool density = !(gfio_conf_read(POWER_MODEL_KEY, model, sizeof(model)) == 0 &&
+                      strcmp(model, "analog") == 0);
+    float floor_pct = settings.pwm_spindle.pwm_min_value;
     if(density) {
         float ticks = gfio_conf_read_float(PULSE_TICKS_KEY, PULSE_TICKS_DEFAULT);
         if(!(ticks >= 1.0f))            /* also catches NaN */
@@ -338,11 +345,19 @@ static bool gflaser_arm (void)
         if(!(min_ticks >= 1.0f))
             min_ticks = PULSE_MIN_TICKS_DEFAULT;
         gf_stream_laser_model((uint32_t)ticks, (uint32_t)min_ticks);
-        if(settings.pwm_spindle.pwm_min_value > 0.0f)
-            report_message("$35 floors the density model; set $35=0 for its full range",
+        /* Here $35 is the density floor, and without one the bottom of
+         * the S range asks for pulses too far apart to re-strike. */
+        if(floor_pct <= 0.0f)
+            report_message("$35 is 0: the bottom of the S range will not fire",
                             Message_Warning);
-    } else
+    } else {
         gf_stream_laser_model(0, 0);
+        /* Here it is a duty floor, and the tube does not lase below the
+         * commissioned one whatever S asks for. */
+        if(floor_pct < ANALOG_FLOOR_PCT)
+            report_message("$35 is below the duty this tube lases at; low S will not fire",
+                            Message_Warning);
+    }
 
     disarm_request = false;
     laser_ok = true;

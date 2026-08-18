@@ -48,16 +48,17 @@
 // the kernel laser latch) and the hardware safety chain.
 #define DEFAULT_LASER_MODE On
 
-// The tube has a wide dead band at the bottom of the duty range: the
-// discharge strikes at about 3 % and draws current from there up, but
-// no sustained light comes out below ~16 % of the 127-count period
-// (PWMSAR 20), so power commanded into that band marks nothing. $35
-// floors every nonzero S at the lowest duty that lases, which is what
-// keeps M4's velocity-scaled power out of the dead band at corners,
-// reversals and short segments. The floor is a tube property, so it is
-// commissioned per machine (the ladder drill in forgefirm
-// scripts/bench/live_fire_drills.py measures it).
-#define DEFAULT_SPINDLE_PWM_MIN_VALUE 16.0f // Percent of full duty
+// The floor of the laser's output range, as a percent of full. Under
+// the shipped FIRE-density dose model this is a DENSITY floor: the
+// bottom of the S range maps onto it, so a commanded 1 % lands at about
+// 10 % density - measured as the lowest level that still marks, where
+// below ~5 % the pulses fall too far apart for the discharge to
+// re-strike at all. Under the analog fallback the same setting is a
+// DUTY floor and wants ~16 instead, the duty this tube lases at; the
+// wrong pairing is a dead band either way, so a machine switched to
+// analog must raise it. Both are tube properties, commissioned per
+// machine with the ladder drills in forgefirm scripts/bench.
+#define DEFAULT_SPINDLE_PWM_MIN_VALUE 10.0f // Percent
 
 // The machine has no limit or home switches; the operator selects the
 // homing method at runtime (homing_mode in /data/forgefirm.conf, set
