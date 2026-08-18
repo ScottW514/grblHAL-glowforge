@@ -60,6 +60,11 @@
                              range for no gain.
     laser_pulse_ticks        density base period in machine ticks
                              (default 20 = 710 us at 28160 Hz)
+    laser_pulse_min_ticks    shortest pulse the density model will emit
+                             (default 3 = 106 us). Below it a period is
+                             skipped and its debt carried, so a low
+                             level arrives as fewer full-width pulses
+                             rather than stubs the supply cannot strike.
 
   grblHAL is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -109,8 +114,16 @@
  * period: 20 ticks of the 28160 Hz stream = 710 us, the factory's
  * ~1.43 kHz pulse rate. */
 #define PULSE_TICKS_DEFAULT 20.0f
+
+/* Shortest pulse worth emitting, in machine ticks. A 36 us stub (one
+ * tick) draws no discharge at all on this supply, and the factory never
+ * emits below one of its 100 us ticks; 3 ticks is 106 us. Below this a
+ * period is skipped and its debt carried, so a low level arrives as
+ * fewer full-width pulses rather than stubs. */
+#define PULSE_MIN_TICKS_DEFAULT 3.0f
 #define POWER_MODEL_KEY "laser_power_model"
 #define PULSE_TICKS_KEY "laser_pulse_ticks"
+#define PULSE_MIN_KEY   "laser_pulse_min_ticks"
 
 /* Spindle state is written by the protocol thread (set_state) and read
  * by the stepper producer's segment updates and the poll below: kept in
@@ -321,12 +334,15 @@ static bool gflaser_arm (void)
         float ticks = gfio_conf_read_float(PULSE_TICKS_KEY, PULSE_TICKS_DEFAULT);
         if(!(ticks >= 1.0f))            /* also catches NaN */
             ticks = PULSE_TICKS_DEFAULT;
-        gf_stream_laser_model((uint32_t)ticks);
+        float min_ticks = gfio_conf_read_float(PULSE_MIN_KEY, PULSE_MIN_TICKS_DEFAULT);
+        if(!(min_ticks >= 1.0f))
+            min_ticks = PULSE_MIN_TICKS_DEFAULT;
+        gf_stream_laser_model((uint32_t)ticks, (uint32_t)min_ticks);
         if(settings.pwm_spindle.pwm_min_value > 0.0f)
             report_message("$35 floors the density model; set $35=0 for its full range",
                             Message_Warning);
     } else
-        gf_stream_laser_model(0);
+        gf_stream_laser_model(0, 0);
 
     disarm_request = false;
     laser_ok = true;

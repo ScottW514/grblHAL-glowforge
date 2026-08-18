@@ -51,8 +51,15 @@ void gf_stream_laser_power (uint8_t power);
 // the remainder carried so densities finer than one tick per period
 // still average out. Density is what the tube's dead band below its
 // lasing threshold requires - every pulse it emits is full-power, so no
-// commanded level lands in the band. Selected per arm.
-void gf_stream_laser_model (uint32_t period_ticks);
+// commanded level lands in the band.
+//
+// min_ticks is the shortest pulse worth emitting: below it a period is
+// skipped and its debt carried, so a low level arrives as fewer
+// full-width pulses instead of stubs too short for the supply to strike
+// (measured: a 36 us stub drew no discharge at all, while the factory
+// never emits below one 100 us tick). The debt is conserved either way,
+// so the average density is the same. Selected per arm.
+void gf_stream_laser_model (uint32_t period_ticks, uint32_t min_ticks);
 
 // Laser arming state (glowforge_laser.c owns the policy). While armed an
 // underrun faults the stream instead of the stop/run retry: a restarted

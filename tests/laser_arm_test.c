@@ -82,7 +82,7 @@ int  gfio_rd_attr(const char *a, char *b, size_t l)
 float gfio_conf_read_float(const char *k, float fb) { (void)k; return fb; }
 /* No laser_power_model key: the arm selects the analog model (period 0). */
 int gfio_conf_read(const char *k, char *v, size_t n) { (void)k; (void)v; (void)n; return -1; }
-void gf_stream_laser_model(uint32_t period) { dose_period_last = period; }
+void gf_stream_laser_model(uint32_t period, uint32_t min_ticks) { (void)min_ticks; dose_period_last = period; }
 void serial_poll(void) {}
 void serial_wait(long us) { (void)us; }
 unsigned serial_client_generation(void) { return 1; }

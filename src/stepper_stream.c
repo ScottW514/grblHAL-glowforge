@@ -220,9 +220,10 @@ static struct {
      * carried remainder so finer densities average out across periods.
      * Written at arm, read by the shipper; all under gf.lock. */
     uint32_t dith_period;
+    uint32_t dith_min;        /* shortest pulse worth emitting, in ticks */
     uint32_t dith_left;       /* ticks left in this period */
     uint32_t dith_on;         /* on-ticks left in this period */
-    uint32_t dith_acc;        /* carried remainder, < GF_PWM_PERIOD */
+    uint32_t dith_acc;        /* carried debt, in 1/GF_PWM_PERIOD ticks */
 
     /* The laser state the core last asked for, recorded whether or not
      * the stream was running: a change made while idle has no event to
@@ -425,8 +426,20 @@ static bool dither_tick (void)
 {
     if(gf.dith_left == 0) {
         uint32_t want = (uint32_t)gf.cur_power * gf.dith_period + gf.dith_acc;
-        gf.dith_on = want / GF_PWM_PERIOD;
-        gf.dith_acc = want % GF_PWM_PERIOD;
+        uint32_t on = want / GF_PWM_PERIOD;
+        if(on < gf.dith_min) {
+            /* Too short to strike: skip this period and carry the whole
+             * debt, so a low level arrives as fewer full-width pulses
+             * rather than as stubs the supply cannot strike at all. The
+             * debt is conserved, so the average density is unchanged. */
+            gf.dith_on = 0;
+        } else {
+            if(on > gf.dith_period)
+                on = gf.dith_period;          /* a period cannot overfill */
+            gf.dith_on = on;
+            want -= on * GF_PWM_PERIOD;
+        }
+        gf.dith_acc = want;
         gf.dith_left = gf.dith_period;
     }
     gf.dith_left--;
@@ -437,13 +450,18 @@ static bool dither_tick (void)
     return false;
 }
 
-void gf_stream_laser_model (uint32_t period_ticks)
+void gf_stream_laser_model (uint32_t period_ticks, uint32_t min_ticks)
 {
     if(period_ticks > DITH_PERIOD_MAX)
         period_ticks = DITH_PERIOD_MAX;
+    if(min_ticks < 1)
+        min_ticks = 1;
+    if(min_ticks > period_ticks)
+        min_ticks = period_ticks;     /* a whole period is the longest pulse */
 
     pthread_mutex_lock(&gf.lock);
     gf.dith_period = period_ticks;
+    gf.dith_min = min_ticks;
     dither_reset();
     pthread_mutex_unlock(&gf.lock);
 }
