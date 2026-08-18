@@ -157,6 +157,11 @@
  * the producer and the shipped cursor (~preload depth of stream time).
  * Grayscale engraving is the heavy case - a power change per pixel can
  * queue hundreds across a 200 ms window. */
+/* Longest base period the density model will take, in machine ticks.
+ * At the 28160 Hz stream rate this is 36 ms; the factory works at 7
+ * ticks of its 10 kHz print rate (700 us). */
+#define DITH_PERIOD_MAX 1024
+
 #define LEV_BITS 12
 #define LEV_N (1u << LEV_BITS)   /* 4096 */
 #define LEV_MASK (LEV_N - 1)
@@ -207,6 +212,23 @@ static struct {
     bool cur_fire;
     bool power_sent;
     bool lev_overflow_warned;
+
+    /* Dose model (gf_stream_laser_model): 0 = analog duty, the value
+     * shipped as a power byte. Otherwise FIRE-bit density at full duty -
+     * dith_period ticks per period, cur_power/GF_PWM_PERIOD of them
+     * firing, the on-count dithered between adjacent integers by the
+     * carried remainder so finer densities average out across periods.
+     * Written at arm, read by the shipper; all under gf.lock. */
+    uint32_t dith_period;
+    uint32_t dith_left;       /* ticks left in this period */
+    uint32_t dith_on;         /* on-ticks left in this period */
+    uint32_t dith_acc;        /* carried remainder, < GF_PWM_PERIOD */
+
+    /* The laser state the core last asked for, recorded whether or not
+     * the stream was running: a change made while idle has no event to
+     * ride, so the next run re-asserts it at its first byte. */
+    uint8_t want_power;
+    bool want_fire;
 
     /* Producer state: vticks/period written only under the core lock. */
     uint64_t vticks;          /* virtual step-clock time since wakeup epoch */
@@ -385,14 +407,51 @@ void gf_stream_pulse (uint8_t step_bits, uint8_t dir_bits)
  * end-of-data backstop keeps the physical lines low between streams -
  * so nothing persists that the next stream does not restate. This also
  * keeps non-laser motion (jogs, homing) fire-free by construction. */
-void gf_stream_laser (uint8_t power, bool fire)
+/* Restart the dither. The accumulator carries across periods, and
+ * across segments, so that a level too fine to express inside one
+ * period still averages out over a run of them; it resets only where
+ * the dose itself restarts - a run boundary, fire going off, a disarm
+ * or an abort - never per segment. Call under gf.lock. */
+static void dither_reset (void)
 {
-    if(gf.failed)
-        return;
+    gf.dith_left = gf.dith_on = gf.dith_acc = 0;
+}
 
-    power &= 0x7f;
+/* One tick of the density model: true when this tick fires. The on-ticks
+ * lead each period, so a level renders as one burst per period rather
+ * than isolated ticks - the pulse the supply sees is
+ * on_count x tick, not a single tick. Call under gf.lock. */
+static bool dither_tick (void)
+{
+    if(gf.dith_left == 0) {
+        uint32_t want = (uint32_t)gf.cur_power * gf.dith_period + gf.dith_acc;
+        gf.dith_on = want / GF_PWM_PERIOD;
+        gf.dith_acc = want % GF_PWM_PERIOD;
+        gf.dith_left = gf.dith_period;
+    }
+    gf.dith_left--;
+    if(gf.dith_on) {
+        gf.dith_on--;
+        return true;
+    }
+    return false;
+}
+
+void gf_stream_laser_model (uint32_t period_ticks)
+{
+    if(period_ticks > DITH_PERIOD_MAX)
+        period_ticks = DITH_PERIOD_MAX;
 
     pthread_mutex_lock(&gf.lock);
+    gf.dith_period = period_ticks;
+    dither_reset();
+    pthread_mutex_unlock(&gf.lock);
+}
+
+/* Queue one laser transition at the current virtual time. Call with
+ * gf.lock held and the stream running. */
+static void laser_event_locked (uint8_t power, bool fire)
+{
     if(gf.streaming) {
         uint64_t idx = gf.base + gf.vticks / VTICKS_PER_BYTE;
         if(idx < gf.shipped)
@@ -420,6 +479,34 @@ void gf_stream_laser (uint8_t power, bool fire)
             gf.lev_tail++;
         }
     }
+}
+
+void gf_stream_laser (uint8_t power, bool fire)
+{
+    if(gf.failed)
+        return;
+
+    power &= 0x7f;
+
+    pthread_mutex_lock(&gf.lock);
+    gf.want_power = power;
+    gf.want_fire = fire;
+    laser_event_locked(power, fire);
+    pthread_mutex_unlock(&gf.lock);
+}
+
+void gf_stream_laser_power (uint8_t power)
+{
+    if(gf.failed)
+        return;
+
+    power &= 0x7f;
+
+    pthread_mutex_lock(&gf.lock);
+    gf.want_power = power;
+    /* Duty only: this path carries no consent to fire, so it rides the
+     * fire state already in effect and never raises it. */
+    laser_event_locked(power, gf.want_fire);
     pthread_mutex_unlock(&gf.lock);
 }
 
@@ -475,6 +562,25 @@ void gf_stream_wakeup (void)
             }
         }
         gf.base = gf.produced;
+
+        /* Re-assert the core's laser state at the first byte of the run.
+         * Without this a change made across the idle gap is lost: a
+         * standalone S word executed while nothing was streaming has no
+         * event to ride, and the run plays at a stale duty - or dark,
+         * since the branches above clear cur_fire. Fire is re-asserted
+         * only inside an armed window, so a window that closed during
+         * the gap cannot be resurrected here; the leading power byte
+         * still precedes it, because the shipper drains events before
+         * emitting the tick. */
+        bool want_fire = gf.want_fire && laser_armed;
+        if(gf.want_power != gf.cur_power || want_fire != gf.cur_fire) {
+            if(gf.lev_tail - gf.lev_head < LEV_N) {
+                gf.lev[gf.lev_tail & LEV_MASK] = (struct laser_ev){
+                    .idx = gf.base, .power = gf.want_power, .fire = want_fire };
+                gf.lev_tail++;
+            }
+        }
+
         if(gf.active)
             gfio_wr_attr("cnc/streaming", "1");
     }
@@ -729,6 +835,7 @@ static bool pending_pass (void)
         gf.run_pending = false;
         gf.kernel_running = false;
         gf.power_sent = false;
+        dither_reset();
         pthread_mutex_unlock(&gf.lock);
         return true;
     }
@@ -791,6 +898,7 @@ static void ship_pass (void)
                 gfio_wr_attr("cnc/streaming", "0");
             gf.kernel_running = false;   /* kernel drains the queue and idles */
             gf.power_sent = false;       /* the next run resets the duty */
+            dither_reset();
             gf.hold_pending = true;
             gf.hold_poll_at = wall_s() + 0.1;
         }
@@ -850,7 +958,20 @@ static void ship_pass (void)
                 gf.lev_head++;
                 due_ev = true;
             }
-            if((due_ev && ev_power != gf.cur_power) || !gf.power_sent) {
+            if(due_ev && !gf.cur_fire)
+                dither_reset();
+            if(gf.dith_period) {
+                /* Density model: the duty is pinned at full and sent
+                 * once per run, and the level rides the FIRE bits
+                 * below - so a level change costs no stream byte at
+                 * all, and never a second power byte the script would
+                 * drop. */
+                gf.cur_power = ev_power;
+                if(!gf.power_sent) {
+                    gf.power_sent = true;
+                    chunk[n++] = 0x80 | GF_PWM_PERIOD;
+                }
+            } else if((due_ev && ev_power != gf.cur_power) || !gf.power_sent) {
                 gf.cur_power = ev_power;
                 gf.power_sent = true;
                 chunk[n++] = 0x80 | gf.cur_power;
@@ -859,7 +980,10 @@ static void ship_pass (void)
             uint32_t slot = gf.shipped & RING_MASK;
             uint8_t b = gf.ring[slot];
             gf.ring[slot] = 0;           /* re-zero for the next lap */
-            if(gf.cur_fire)
+            /* The density model can only ever withhold a fire tick the
+             * core asked for: it masks cur_fire, it is never a source of
+             * one. Emission stays exactly where the core commanded it. */
+            if(gf.cur_fire && (!gf.dith_period || dither_tick()))
                 b |= 0x10;
             chunk[n++] = b;
             gf.shipped++;
@@ -899,6 +1023,7 @@ static void ship_pass (void)
             pthread_mutex_lock(&gf.lock);
             gf.kernel_running = false;
             gf.power_sent = false;
+            dither_reset();
             pthread_mutex_unlock(&gf.lock);
         }
     }
@@ -978,7 +1103,9 @@ void gf_stream_reset (void)
         gf.streaming = false;
         gf.lev_head = gf.lev_tail;   /* unshipped laser transitions die with the backlog */
         gf.cur_fire = false;
+        gf.want_fire = false;        /* nothing re-asserts fire after an abort */
         gf.power_sent = false;
+        dither_reset();
         if(gf.kernel_running) {
             if(gf.active) {
                 gfio_wr_attr("cnc/stop", "1");
@@ -1129,6 +1256,7 @@ bool gf_stream_resume (void)
     gf.cur_power = 0;
     gf.cur_fire = false;
     gf.power_sent = false;
+    dither_reset();
     pthread_mutex_unlock(&gf.lock);
 
     if(!ok)

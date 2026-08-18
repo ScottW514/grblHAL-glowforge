@@ -45,6 +45,7 @@ static int  fire_ok_calls;
 static int   alarms_raised;
 static char  last_message[128];
 static bool  stream_armed;          /* gf_stream_laser_arm(true) reached? */
+static uint32_t dose_period_last = 1;  /* gf_stream_laser_model() argument */
 static bool  latch_locked_last;
 
 /* Switch source: gfsw_read_raw() plays this script of EV_SW words, one
@@ -79,6 +80,9 @@ void gf_stream_laser_latch(bool lock) { latch_locked_last = lock; }
 int  gfio_rd_attr(const char *a, char *b, size_t l)
 { (void)a; if (l) b[0] = '\0'; return -1; }
 float gfio_conf_read_float(const char *k, float fb) { (void)k; return fb; }
+/* No laser_power_model key: the arm selects the analog model (period 0). */
+int gfio_conf_read(const char *k, char *v, size_t n) { (void)k; (void)v; (void)n; return -1; }
+void gf_stream_laser_model(uint32_t period) { dose_period_last = period; }
 void serial_poll(void) {}
 void serial_wait(long us) { (void)us; }
 unsigned serial_client_generation(void) { return 1; }
@@ -182,6 +186,7 @@ int main(void)
     CHECK(armed_b, "arms when the gate is clear at both checks");
     CHECK(laser_ok, "armed window opens when clear");
     CHECK(stream_armed, "stream is told armed when clear");
+    CHECK(dose_period_last == 0, "no laser_power_model key selects the analog dose model");
 
     /* Case C - blocked at the pre-wait check: refuses before arming. */
     reset_state();

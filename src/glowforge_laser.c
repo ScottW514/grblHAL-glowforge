@@ -51,6 +51,15 @@
                              to the default, never wait-forever)
     laser_disarm_s           spindle-off grace before the armed window
                              closes (default 60)
+    laser_power_model        density (dose as FIRE-bit density at full
+                             duty) or analog (dose as PWM duty, the
+                             default). Density wants $35 = 0: the floor
+                             exists only because an analog duty cannot
+                             go low without leaving the lasing band, and
+                             it clamps the light end of the density
+                             range for no gain.
+    laser_pulse_ticks        density base period in machine ticks
+                             (default 20 = 710 us at 28160 Hz)
 
   grblHAL is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -88,8 +97,20 @@
 #define DISARM_S_DEFAULT         60.0f
 
 /* Hardware PWM resolution: the power byte's 7 bits are written raw into
- * PWMSAR against a 127-count period (scope-verified 40 kHz carrier). */
-#define PWM_PERIOD 127
+ * PWMSAR against a 127-count period (scope-verified 40 kHz carrier).
+ * One definition, in stepper_stream.h - the shipper renders against it. */
+#define PWM_PERIOD GF_PWM_PERIOD
+
+/* Dose model. The tube draws current from ~3 % duty but does not lase
+ * usefully below ~16 %, so an analog duty scaled by S walks into a dead
+ * band at every corner and short segment. The density model instead
+ * pins the duty at full and modulates how many ticks of each base
+ * period fire, which cannot land in the band by construction. Default
+ * period: 20 ticks of the 28160 Hz stream = 710 us, the factory's
+ * ~1.43 kHz pulse rate. */
+#define PULSE_TICKS_DEFAULT 20.0f
+#define POWER_MODEL_KEY "laser_power_model"
+#define PULSE_TICKS_KEY "laser_pulse_ticks"
 
 /* Spindle state is written by the protocol thread (set_state) and read
  * by the stepper producer's segment updates and the poll below: kept in
@@ -291,12 +312,28 @@ static bool gflaser_arm (void)
         return false;
     }
 
+    /* Select the dose model for this window, before any fire reaches
+     * the stream. */
+    char model[16] = "";
+    bool density = gfio_conf_read(POWER_MODEL_KEY, model, sizeof(model)) == 0 &&
+                    strcmp(model, "density") == 0;
+    if(density) {
+        float ticks = gfio_conf_read_float(PULSE_TICKS_KEY, PULSE_TICKS_DEFAULT);
+        if(!(ticks >= 1.0f))            /* also catches NaN */
+            ticks = PULSE_TICKS_DEFAULT;
+        gf_stream_laser_model((uint32_t)ticks);
+        if(settings.pwm_spindle.pwm_min_value > 0.0f)
+            report_message("$35 floors the density model; set $35=0 for its full range",
+                            Message_Warning);
+    } else
+        gf_stream_laser_model(0);
+
     disarm_request = false;
     laser_ok = true;
     disarm_at = 0.0;
     armed_client_gen = serial_client_generation();
     gf_stream_laser_arm(true);
-    report_message("laser armed", Message_Info);
+    report_message(density ? "laser armed (density)" : "laser armed", Message_Info);
 
     return true;
 }
@@ -318,7 +355,7 @@ static bool spindleConfig (spindle_ptrs_t *spindle)
 
 static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, float rpm)
 {
-    (void)spindle; (void)rpm;
+    (void)spindle;
 
     spindle_state_t cur = { .value = atomic_load(&cur_state_value) };
 
@@ -326,6 +363,16 @@ static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, flo
         state.on = Off;                 /* refused/aborted: stay dark */
 
     atomic_store(&cur_state_value, state.value);
+
+    /* The synchronous path carries the speed. Per-segment updates cover
+     * a laser block, but an S word executed between blocks - with the
+     * planner drained, so nothing is streaming - only arrives here, and
+     * dropping it leaves the next move cutting at the previous level.
+     * Duty only: fire stays where spindleUpdatePWM and its gates put it. */
+    if(state.on && spindle_pwm.compute_value) {
+        uint_fast16_t pwm = spindle_pwm.compute_value(&spindle_pwm, rpm, false);
+        gf_stream_laser_power((uint8_t)(pwm > PWM_PERIOD ? PWM_PERIOD : pwm));
+    }
 }
 
 static spindle_state_t spindleGetState (spindle_ptrs_t *spindle)
