@@ -91,6 +91,7 @@
 #include "glowforge_laser.h"
 
 #include "grbl/hal.h"
+#include "grbl/planner.h"
 #include "grbl/protocol.h"
 #include "grbl/report.h"
 #include "grbl/state_machine.h"
@@ -138,6 +139,7 @@ static bool park_saw_cycle;
 static bool hold_seen;                     /* lid_policy=hold: parked, policy already read */
 static bool have_job_start;
 static float job_start[N_AXIS];            /* machine position when the job began */
+static bool job_active;                    /* a job is under way (running or held) */
 static sys_state_t prev_state = STATE_IDLE;
 static on_state_change_ptr on_state_change_chain;
 
@@ -214,16 +216,30 @@ static control_signals_t visible (control_signals_t now)
     return now;
 }
 
-/* Job start = the machine position at the Idle -> Cycle transition of a
-   job (not a jog, not the park itself): where a cancelled job's head
-   returns to, as the factory returns to its job origin. */
+/* Job start = the machine position at the Idle -> Cycle transition that
+   begins a job (not a jog, not the park itself): where a cancelled job's
+   head returns to, as the factory returns to its job origin.
+
+   A job is under way from that transition until the core is Idle with
+   the planner empty (the program ran out, a stop, a reset) or in an
+   alarm. The core restarts a held cycle through Idle with the planner
+   still loaded, so a pause and resume is the same job and keeps its
+   start; a job abandoned in a hold and reset is over. */
 static void onStateChange (sys_state_t new_state)
 {
-    if(new_state == STATE_CYCLE && prev_state == STATE_IDLE && cancel_state == Cancel_None) {
-        int32_t steps[N_AXIS];
-        memcpy(steps, sys.position, sizeof(steps));
-        system_convert_array_steps_to_mpos(job_start, steps);
-        have_job_start = true;
+    if(new_state == STATE_IDLE) {
+        if(plan_get_current_block() == NULL)
+            job_active = false;
+    } else if(new_state & (STATE_ALARM|STATE_ESTOP|STATE_SLEEP))
+        job_active = false;
+    else if(new_state == STATE_CYCLE && prev_state == STATE_IDLE && !job_active) {
+        if(cancel_state == Cancel_None) {
+            int32_t steps[N_AXIS];
+            memcpy(steps, sys.position, sizeof(steps));
+            system_convert_array_steps_to_mpos(job_start, steps);
+            have_job_start = true;
+        }
+        job_active = true;
     }
     prev_state = new_state;
 
